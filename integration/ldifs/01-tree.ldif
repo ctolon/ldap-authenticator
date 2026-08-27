@@ -1,0 +1,55 @@
+# The fixture the integration suite expects. It is deliberately small and
+# deliberately awkward: one user whose CN contains a comma, so that DN
+# escaping is exercised against a real server rather than against a fake.
+#
+# The base entry dc=example,dc=com and the admin account are created by the
+# image from LDAP_DOMAIN, so they are not defined here.
+
+dn: ou=people,dc=example,dc=com
+objectClass: organizationalUnit
+ou: people
+
+dn: ou=groups,dc=example,dc=com
+objectClass: organizationalUnit
+ou: groups
+
+dn: cn=readonly,dc=example,dc=com
+objectClass: inetOrgPerson
+cn: readonly
+sn: Service Account
+userPassword: service-password
+
+dn: uid=alice,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: alice
+cn: Alice Example
+sn: Example
+mail: alice@example.com
+userPassword: alice-password
+
+dn: uid=bob,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: bob
+cn: Bob Example
+sn: Example
+mail: bob@example.com
+userPassword: bob-password
+
+dn: uid=awkward,ou=people,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: awkward
+cn: Comma, Person
+sn: Person
+mail: awkward@example.com
+userPassword: awkward-password
+
+dn: cn=developers,ou=groups,dc=example,dc=com
+objectClass: groupOfNames
+cn: developers
+member: uid=alice,ou=people,dc=example,dc=com
+
+dn: cn=staff,ou=groups,dc=example,dc=com
+objectClass: groupOfNames
+cn: staff
+member: cn=developers,ou=groups,dc=example,dc=com
+member: uid=bob,ou=people,dc=example,dc=com

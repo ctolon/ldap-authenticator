@@ -1,0 +1,161 @@
+# Tag-driven releases. The tag is the release; this workflow verifies that
+# the tag is one that should have been created, and then publishes it.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'contrib/*/v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: tag to release
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      module: ${{ steps.parse.outputs.module }}
+      prerelease: ${{ steps.parse.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - id: parse
+        name: parse the tag
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+
+          # contrib/gin/v0.1.0 -> module=contrib/gin, version=0.1.0
+          # v0.1.0             -> module=.,           version=0.1.0
+          case "$tag" in
+            contrib/*/v*) module="${tag%/v*}"; version="${tag##*/v}" ;;
+            v*)           module="."; version="${tag#v}" ;;
+            *)            echo "::error::$tag is not a release tag"; exit 1 ;;
+          esac
+
+          case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+
+          {
+            echo "tag=$tag"
+            echo "module=$module"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: the tag is on main
+        run: |
+          tag="${{ steps.parse.outputs.tag }}"
+          git fetch --quiet origin main
+          git merge-base --is-ancestor "$tag" origin/main \
+            || { echo "::error::$tag is not an ancestor of main"; exit 1; }
+
+      - name: the changelog has a section for it
+        if: steps.parse.outputs.module == '.'
+        run: ./scripts/changelog.sh "${{ steps.parse.outputs.version }}" > /dev/null
+
+      # The gate, run against exactly the commit being published rather
+      # than against whatever was on a developer's disk.
+      - name: the gate passes at this commit
+        run: make check
+
+      # A contrib module is developed against the checkout through a
+      # replace directive, so this is the first time it is built against
+      # the version it actually requires. If the require line is wrong,
+      # this is where it shows.
+      - name: the contrib module builds against the published root
+        if: steps.parse.outputs.module != '.'
+        run: |
+          cd "${{ steps.parse.outputs.module }}"
+          go mod edit -dropreplace github.com/ctolon/ldap-authenticator
+          go mod tidy
+          go build ./...
+          go test ./...
+
+  publish:
+    name: publish
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: notes
+        name: build the release notes
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          module="${{ needs.verify.outputs.module }}"
+          version="${{ needs.verify.outputs.version }}"
+
+          {
+            echo "body<<RELEASE_NOTES_EOF"
+
+            if [ "$module" = "." ]; then
+              ./scripts/changelog.sh "$version"
+              echo
+              echo '```sh'
+              echo "go get github.com/ctolon/ldap-authenticator@$tag"
+              echo '```'
+            else
+              echo "Framework middleware module \`$module\`, released alongside \`v$version\` of the root module."
+              echo
+              echo '```sh'
+              echo "go get github.com/ctolon/ldap-authenticator/$module@v$version"
+              echo '```'
+            fi
+
+            echo
+            echo "[Documentation](https://pkg.go.dev/github.com/ctolon/ldap-authenticator@$tag) · [Changelog](https://github.com/ctolon/ldap-authenticator/blob/main/CHANGELOG.md)"
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: publish the release
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          body: ${{ steps.notes.outputs.body }}
+          prerelease: ${{ needs.verify.outputs.prerelease }}
+
+  index:
+    name: warm the module proxy
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: ask the proxy for the new version
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          module="${{ needs.verify.outputs.module }}"
+
+          if [ "$module" = "." ]; then
+            path="github.com/ctolon/ldap-authenticator@$tag"
+          else
+            path="github.com/ctolon/ldap-authenticator/$module@v${{ needs.verify.outputs.version }}"
+          fi
+
+          for attempt in 1 2 3 4 5; do
+            if GOPROXY=https://proxy.golang.org go list -m "$path"; then
+              exit 0
+            fi
+
+            echo "not indexed yet (attempt $attempt); waiting"
+            sleep 30
+          done
+
+          echo "::warning::the proxy has not indexed $path yet; it usually catches up within the hour"

@@ -1,0 +1,58 @@
+name: Bug report
+description: Something does not behave the way the documentation says it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report a security vulnerability here.** Use the
+        [advisory form](https://github.com/ctolon/ldap-authenticator/security/advisories/new);
+        issues are public from the moment they are opened.
+
+        Before filing, check [docs/troubleshooting.md](https://github.com/ctolon/ldap-authenticator/blob/main/docs/troubleshooting.md).
+        It covers the failures that turn out to be directory ACLs, which is
+        most of them.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: And what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: The options you passed to New
+      description: With the passwords removed.
+      render: go
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Can you reproduce it against ldaptest?
+      description: |
+        If you can, paste the test — that makes it a bug in this package
+        and it will be fixed. If you cannot, say what your directory is
+        (OpenLDAP, Active Directory, 389-ds, something else) and what
+        version.
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: The error, in full
+      description: Including everything under it. Every error here wraps its cause.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: v0.1.0
+    validations:
+      required: true
