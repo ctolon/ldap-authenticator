@@ -63,6 +63,14 @@ type Cache interface {
 
 	// InvalidateUser drops every entry for one account, whatever password
 	// keyed it, and reports how many it dropped.
+	//
+	// The in-memory implementation walks the whole cache to do it, which
+	// is fine at the default bound of a few thousand entries and would
+	// not be at a million. It is called when somebody's password changes,
+	// not on the login path, and a credential cache large enough for the
+	// walk to matter is a credential cache that has stopped being a
+	// cache — but an implementation that expects to hold a great many
+	// entries should index by username rather than scan.
 	InvalidateUser(ctx context.Context, username string) (int, error)
 
 	// InvalidateAll drops everything and reports how many it dropped.

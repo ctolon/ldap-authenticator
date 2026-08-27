@@ -496,6 +496,64 @@ func WithAnonymousServiceBind() Option {
 	}
 }
 
+// WithReferralPolicy decides what happens when a search comes back with
+// referrals and no entries.
+//
+// A referral is the directory saying "not in this partition, try over
+// there". On a single-domain deployment it never happens; on a
+// multi-domain Active Directory forest it happens whenever a base DN names
+// a partition that does not hold the object — which is a configuration
+// mistake that otherwise presents as "no such user", and sends somebody
+// hunting for an account that is exactly where it should be.
+//
+// [ReferralIgnore], the default, treats the answer as empty and logs a
+// warning. [ReferralFail] returns [ErrReferral] with the URLs on the
+// [AuthError], which is what to use once you are confident your base DNs
+// are right.
+//
+// Neither follows the referral, and that is a decision rather than an
+// omission: following one means opening a connection to a host the
+// directory named and presenting the service account's password to it.
+// Use the Global Catalog for a forest-wide search instead — see
+// docs/directories.md.
+func WithReferralPolicy(policy ReferralPolicy) Option {
+	return func(c *config) error {
+		if !policy.valid() {
+			return fmt.Errorf("%w: referral policy %d is not valid", ErrInvalidOption, int(policy))
+		}
+
+		c.referralPolicy = policy
+
+		return nil
+	}
+}
+
+// WithPasswordPolicyControl asks for the password policy control on every
+// bind, which is how a directory other than Active Directory says *why* it
+// refused a credential.
+//
+// With it, [AuthError.Reason] can distinguish an expired password, a
+// locked account, or one that must be changed after a reset, on OpenLDAP,
+// 389 Directory Server and anything else implementing
+// draft-behera-ldap-password-policy. Active Directory needs nothing here:
+// it puts the same information in the error text, and this package reads
+// it either way.
+//
+// It is off by default because it changes what goes on the wire. The
+// control is non-critical, so a directory that does not know it ignores
+// it, but "adds an unrequested control to every bind" is not a thing to do
+// to somebody without asking.
+//
+// The reason never changes what [Client.Authenticate] returns. It is for
+// the log line and the audit trail; see [RejectionReason].
+func WithPasswordPolicyControl() Option {
+	return func(c *config) error {
+		c.passwordPolicyControl = true
+
+		return nil
+	}
+}
+
 // ---- attributes -----------------------------------------------------------
 
 // WithUsernameAttribute names the attribute read into Principal.Username.
@@ -982,7 +1040,16 @@ func WithCacheStore(store Cache) Option {
 // as a secret — anybody holding it can test a guessed credential against
 // the cache offline.
 //
-// At least 16 bytes; 32 is the size the package generates.
+// Use 32 bytes — 256 bits, the size this package generates when you do not
+// supply one. Sixteen is the hard floor for compatibility, and a secret
+// below 32 is logged as a warning at startup.
+//
+// Treat it the way you treat the service account password, and not as the
+// same value: it is a different secret protecting a different thing, and
+// reusing one for both means a compromise of either is a compromise of
+// both. Rotate it on the same schedule, and remember that rotating it
+// invalidates the shared cache rather than corrupting it — every key
+// changes at once, so the worst that happens is a cold cache.
 func WithCacheSecret(secret []byte) Option {
 	return func(c *config) error {
 		const minimum = 16
@@ -1000,6 +1067,27 @@ func WithCacheSecret(secret []byte) Option {
 	}
 }
 
+// WithCacheUsernameHashing replaces the username the cache store sees
+// with a keyed hash of it, under the same secret as the key.
+//
+// The key already hides the credential, but the username travels alongside
+// it in the clear, because [Client.InvalidateUser] has to find an
+// account's entries without knowing the password. On a store that is
+// shared, remote, or backed up, that username is personal data this
+// package put there. With this, the store holds nothing anybody can read,
+// and invalidation still works because it hashes the same way.
+//
+// What it costs is the ability to look in the cache and see who is in it,
+// which is a real debugging affordance — which is why this is a choice
+// rather than the default.
+func WithCacheUsernameHashing() Option {
+	return func(c *config) error {
+		c.hashCacheUsernames = true
+
+		return nil
+	}
+}
+
 // WithCacheSize bounds the number of cached entries. When the bound is
 // reached the oldest entries are dropped.
 func WithCacheSize(entries int) Option {
@@ -1009,6 +1097,58 @@ func WithCacheSize(entries int) Option {
 		}
 
 		c.cacheMaxEntries = entries
+
+		return nil
+	}
+}
+
+// WithLockoutProtection refuses an account locally after too many recent
+// failures, so that the attempts never reach the directory's own lockout
+// counter.
+//
+//	ldapauth.WithLockoutProtection(4, 5*time.Minute, time.Minute)
+//
+// The threat is not brute force. A directory that locks an account after
+// five failures is a directory where anybody who knows a username can lock
+// that account out from anywhere, by getting the password wrong five
+// times — no access needed, and the victim is the one who calls the help
+// desk. This package already refuses to make it worse by retrying a
+// rejected credential; this is what stops it being the instrument.
+//
+// Attempts served from the cache do not count and are not blocked, so a
+// user who logged in recently keeps working while somebody guesses at
+// their username. Without a cache there is nothing to serve them from, and
+// they are refused along with the attacker — which is a local cooldown of
+// a minute rather than a directory lockout an administrator has to clear,
+// but it is a real cost and it is why this is not on by default.
+//
+// Two limits worth knowing. It counts failures per account, not requests
+// per client, so it is not a rate limiter — put one in front. And the
+// counters are per process, so twenty replicas pass twenty times the
+// threshold through before all of them are blocking. Making that exact
+// would mean a round trip to somewhere shared on every failed login, paid
+// on the attack path to make the attack slightly harder.
+//
+// Zero attempts turns it off, which is the default.
+func WithLockoutProtection(attempts int, window, cooldown time.Duration) Option {
+	return func(c *config) error {
+		if attempts < 0 {
+			return fmt.Errorf("%w: lockout attempts %d is negative", ErrInvalidOption, attempts)
+		}
+
+		if attempts > 0 {
+			if window <= 0 {
+				return fmt.Errorf("%w: lockout window %s is not positive", ErrInvalidOption, window)
+			}
+
+			if cooldown <= 0 {
+				return fmt.Errorf("%w: lockout cooldown %s is not positive", ErrInvalidOption, cooldown)
+			}
+		}
+
+		c.throttleAttempts = attempts
+		c.throttleWindow = window
+		c.throttleCooldown = cooldown
 
 		return nil
 	}

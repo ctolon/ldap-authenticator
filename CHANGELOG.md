@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+A review of the 1.0 release asked nine questions about running this in an
+enterprise directory. Five of them wanted code; the rest wanted the library
+to be honest about where its responsibility ends, and are answered in the
+documentation.
+
+### Added
+
+**Why the directory refused.** `AuthError.Reason` carries a typed
+`RejectionReason` — expired password, disabled account, locked account,
+logon-hour restriction, and the rest — read from Active Directory's data
+code, which it puts in the text of an otherwise generic error. On OpenLDAP
+and 389 Directory Server the same information arrives through the password
+policy control, with the new `WithPasswordPolicyControl()`.
+
+`Authenticate` still returns `ErrInvalidCredentials` for every one of them.
+That is the point: a login form that could tell "password expired" from
+"wrong password" is a slower account enumeration oracle, but it is still
+one. The reason is for the log line, the audit trail, and the metric label,
+and `ReasonFor(err)` gets it without a type assertion. `Actionable()`
+reports whether trying again could help, which is the distinction a help
+desk cares about.
+
+**Referrals.** A search answered with referrals and no entries used to be
+indistinguishable from "no such user" — which, on a multi-domain Active
+Directory forest, is the most confusing way for a base DN to be pointing at
+the wrong partition. It is now logged, and `WithReferralPolicy(ReferralFail)`
+turns it into `ErrReferral` with the URLs on the error.
+
+Following a referral is still not on offer, and that is a decision: it
+means opening a connection to a host the directory named and presenting the
+service account's password to it. Use the Global Catalog, or one
+authenticator per domain. See docs/directories.md.
+
+**Lockout protection.** `WithLockoutProtection(attempts, window, cooldown)`
+refuses an account locally after too many recent failures, so the attempts
+never reach the directory's own lockout counter. A directory that locks an
+account after five failures is a directory where anybody who knows a
+username can lock that account out; this package already refused to make
+that worse by retrying, and now it declines to be the instrument. Attempts
+served from the cache do not count and are not blocked, so a user who
+logged in recently keeps working while somebody guesses at their username.
+
+**`Reloadable`.** The service account password is read once, and rotating
+it means building a new `Client` and swapping the pointer. This is that,
+with the ordering that everybody gets wrong done right: `Replace` hands
+back the old `Client` so it is closed *after* the swap rather than before.
+`examples/reloading` runs a rotation under load and counts the failures;
+there are none.
+
+**`WithCacheUsernameHashing()`.** The cache key already hides the
+credential, but the username travelled beside it in the clear, because
+`InvalidateUser` has to find an account's entries without knowing the
+password — so a shared or backed-up store held a list of who had logged in
+recently. With this, it holds a keyed hash instead, and invalidation still
+works.
+
+### Changed
+
+- `Status` in `httpauth` maps `ErrTooManyAttempts` to 429. The credentials
+  were never tried, so 401 would be a lie.
+- An `*AuthError` is no longer wrapped in another `*AuthError`. It read
+  correctly and lost information: `errors.As` stops at the outermost match,
+  so a `Reason` or a `Referrals` set deeper down was unreachable.
+- A cache secret shorter than 32 bytes is logged as a warning at startup.
+  Sixteen remains the hard floor.
+- `Stats` reports `BlockedAccounts`.
+- The fuzz gate caps its workers at eight rather than one per core. On a
+  large machine the uncapped count starved the coordinator, and the run
+  failed with `context deadline exceeded` — a gate that fails because the
+  machine was busy is a gate people learn to ignore.
+
+### Fixed
+
+- The Go Report Card badge is gone. The service retired; the badge it
+  served said so, in place of a grade.
+- The Scorecard job no longer asks to publish its result on a push.
+  `scorecard-action` publishes only from a scheduled run, so asking on a
+  push did nothing except look like it had worked — which is how a badge
+  reads "invalid repo path" while every workflow run is green. The push
+  run still uploads SARIF to code scanning. The badge is out of the README
+  until the first scheduled run produces something for it to show; see
+  RELEASING.md.
+
+### Documented
+
+Four questions that wanted an answer rather than a feature.
+
+**Rate limiting and circuit breaking stay outside**, because their policy
+is about your traffic rather than about your directory. Both are decorators
+over `Authenticator`, which is why that interface exists;
+`examples/layered` is a working one of each in about sixty lines, including
+the detail that a rejected credential is a working directory and must not
+open a breaker.
+
+**Distributed cache invalidation** is a table in docs/production.md now.
+With local caches and twenty replicas, disabling an account leaves nineteen
+of them letting it in until their TTLs expire. Share the cache, or keep the
+TTL short enough not to care. This package will not ship a message bus.
+
+**The shared cache secret is a credential**, and docs/security.md now spells
+out what holding it buys: offline credential testing against the cache,
+with no bind, no directory, and no failed-login counter. Separate it from
+the bind password, use 32 bytes, rotate it, and put an ACL and TLS in front
+of the store.
+
+**`InvalidateUser` on the in-memory cache is linear**, which is fine at the
+default bound and would not be at a million entries. It is called when
+somebody's password changes rather than on the login path, and a credential
+cache large enough for the walk to matter has stopped being a cache — but
+the `Cache` documentation says so now, for anyone implementing one that
+expects to be large.
+
 ## [1.0.0] - 2026-08-27
 
 The first release. An LDAP authenticator whose only direct dependency is

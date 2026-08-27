@@ -24,8 +24,31 @@ Then, once and by hand:
 - Check that the `ci-green` check name appears in the branch protection
   rule after the first workflow run; a required check that has never run is
   a required check GitHub will not enforce.
-- Publish the OpenSSF Scorecard result by running the Security workflow
-  manually, so the badge in the README resolves.
+
+## The OpenSSF Scorecard badge
+
+There is no Scorecard badge in the README, and adding one before the first
+scheduled run would put a broken image on the front page.
+
+`scorecard-action` publishes to the OpenSSF API **only on a scheduled
+run** — not on a push, and not on a manual dispatch. Until the weekly cron
+in `security.yml` fires, the API has nothing for this repository and the
+badge renders "invalid repo path" however green every workflow run looks.
+
+After the first Monday, check:
+
+```sh
+curl -s https://api.scorecard.dev/projects/github.com/ctolon/ldap-authenticator | head -c 200
+```
+
+Once that returns a score rather than a 404, the badge is worth adding:
+
+```markdown
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/ctolon/ldap-authenticator/badge)](https://scorecard.dev/viewer/?uri=github.com/ctolon/ldap-authenticator)
+```
+
+The push-triggered run is still worth having: it uploads SARIF to code
+scanning, which is the part that is useful per commit.
 
 ## The order matters
 

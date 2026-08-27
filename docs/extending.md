@@ -168,6 +168,34 @@ A custom dialer takes over responsibility for TLS: the TLS options are not
 applied to it, and the plaintext check in `New` is skipped, because there
 is no way for this package to know what your dialer negotiated.
 
+## Swapping the whole client
+
+The service account password is read once, at construction. To rotate it,
+build a new `Client` and swap the pointer:
+
+```go
+auth := ldapauth.NewReloadable(client)   // implements Authenticator
+
+// later
+next, err := ldapauth.New(optionsWith(newPassword)...)
+if err != nil {
+    return err                  // a failed reload keeps the working client
+}
+
+previous := auth.Replace(next)
+previous.Close()
+```
+
+`Replace` returns the old `Client` rather than closing it, because when to
+close it is your decision — immediately for a password rotation, after a
+grace period if something outside this package still holds a reference.
+
+The ordering is the part that is easy to get wrong: close the old one
+*after* the swap. Closing it does not interrupt requests already running on
+it, and by the time you call Close nothing new is choosing it.
+[`examples/reloading`](../examples/reloading) does it under load and counts
+the failures; there are none.
+
 ## Metrics
 
 ```go

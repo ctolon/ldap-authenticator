@@ -223,3 +223,44 @@ func (s *serverSet) healthy() int {
 
 	return n
 }
+
+// A ReferralPolicy decides what to do about a search the directory
+// answered with referrals instead of entries.
+//
+// A referral is the directory saying "what you are looking for is not in
+// this partition; try over there". On a single-domain deployment it never
+// happens. On a multi-domain Active Directory forest it happens whenever a
+// base DN names a partition that does not hold the object — which is a
+// configuration mistake that otherwise presents as "that user does not
+// exist", and is the single most confusing way for an AD deployment to
+// fail.
+type ReferralPolicy int
+
+const (
+	// ReferralIgnore treats a referral-only answer as an empty answer,
+	// and logs a warning saying that is what happened. It is the default,
+	// because it is what every version of this package has done and
+	// because a referral alongside entries is normal on AD.
+	ReferralIgnore ReferralPolicy = iota
+
+	// ReferralFail turns a referral-only answer into ErrReferral, with
+	// the URLs on the AuthError. Use it when you know your base DNs are
+	// right, so that the day they stop being right you are told rather
+	// than left wondering why a user vanished.
+	ReferralFail
+)
+
+// String returns a stable, lower-case name for the policy, suitable for
+// a log field or a metrics label.
+func (p ReferralPolicy) String() string {
+	switch p {
+	case ReferralIgnore:
+		return "ignore"
+	case ReferralFail:
+		return "fail"
+	default:
+		return fmt.Sprintf("ReferralPolicy(%d)", int(p))
+	}
+}
+
+func (p ReferralPolicy) valid() bool { return p >= ReferralIgnore && p <= ReferralFail }

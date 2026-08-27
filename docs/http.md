@@ -117,6 +117,7 @@ ctx := httpauth.WithIdentity(r.Context(), &ldapauth.Principal{
 | 400 | the request was not a login: no username, an empty password, a malformed body | empty |
 | 401 | wrong or absent credentials | empty, with `WWW-Authenticate` |
 | 403 | the credentials were right and the groups were not | empty |
+| 429 | this account is in a local cooldown, under `WithLockoutProtection` | empty |
 | 503 | the directory could not answer | empty |
 
 The distinction between 401 and 403 is the one that matters to a client:

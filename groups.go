@@ -275,6 +275,10 @@ func (g *directoryGroups) searchGroups(ctx context.Context, request GroupRequest
 		nil,
 	))
 	if err != nil {
+		if inner, ok := asAuthError(err); ok {
+			return nil, inner.enrich("group search", g.cfg.safeUsername(request.Username))
+		}
+
 		return nil, &AuthError{
 			Op:         "group search",
 			Username:   g.cfg.safeUsername(request.Username),

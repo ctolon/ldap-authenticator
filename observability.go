@@ -21,6 +21,10 @@ const (
 	// network: an empty password, a username with a NUL in it.
 	ResultRejected = "rejected"
 
+	// ResultThrottled is a request refused locally by
+	// WithLockoutProtection, without asking the directory.
+	ResultThrottled = "throttled"
+
 	// ResultError is any other failure — the directory was unreachable,
 	// the search failed, the context expired.
 	ResultError = "error"

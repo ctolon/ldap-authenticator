@@ -300,6 +300,9 @@ func (p *Policy) Reject(w http.ResponseWriter, r *http.Request, err error) {
 	case http.StatusBadRequest:
 		w.WriteHeader(http.StatusBadRequest)
 
+	case http.StatusTooManyRequests:
+		w.WriteHeader(http.StatusTooManyRequests)
+
 	default:
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
@@ -314,6 +317,7 @@ func (p *Policy) Reject(w http.ResponseWriter, r *http.Request, err error) {
 //	401  the credentials were wrong, or absent
 //	403  the credentials were right and the groups were not
 //	400  the request was not a login: no username, no password
+//	429  this account has been refused too often too recently
 //	503  the directory could not answer
 func Status(err error) int {
 	switch {
@@ -322,6 +326,13 @@ func Status(err error) int {
 
 	case errors.Is(err, ErrForbidden):
 		return http.StatusForbidden
+
+	// The account is in a local cooldown under
+	// ldapauth.WithLockoutProtection. 429 rather than 401, because the
+	// credentials were never tried: telling the client to slow down is
+	// both the truth and the thing that helps.
+	case errors.Is(err, ldapauth.ErrTooManyAttempts):
+		return http.StatusTooManyRequests
 
 	case errors.Is(err, ldapauth.ErrInvalidCredentials),
 		errors.Is(err, ErrNoCredentials):

@@ -24,10 +24,12 @@
 //
 // # Making things go wrong
 //
-//	dir.SetDown(url, true)     dialling fails, and live connections break
-//	dir.DialHook = ...         fail, count, or delay a dial
-//	dir.BindHook = ...         the same for binds
-//	dir.SearchHook = ...       and for searches
+//	dir.SetDown(url, true)      dialling fails, and live connections break
+//	dir.DialHook = ...          fail, count, or delay a dial
+//	dir.BindHook = ...          the same for binds
+//	dir.SearchHook = ...        and for searches
+//	dir.ReferralHook = ...      answer a search with referrals, as a forest does
+//	dir.BindControlHook = ...   answer a bind with the password policy control
 //
 // [Directory.SetDown] also breaks connections that were already open,
 // which is what a server going down actually does and what a connection

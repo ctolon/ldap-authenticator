@@ -521,3 +521,37 @@ func TestPolicyAccessorsReportWhatTheAdaptersNeed(t *testing.T) {
 		t.Error("ShouldSkip(nil) = true")
 	}
 }
+
+func TestLockoutIsTooManyRequests(t *testing.T) {
+	t.Parallel()
+
+	// The credentials were never tried, so 401 would be a lie and 503
+	// would be somebody else's problem. 429 is both true and actionable.
+	if got := httpauth.Status(ldapauth.ErrTooManyAttempts); got != http.StatusTooManyRequests {
+		t.Errorf("Status = %d, want 429", got)
+	}
+
+	auth := newAuth(t, ldapauth.WithLockoutProtection(2, time.Minute, time.Minute), ldapauth.WithoutRetry())
+
+	handler := httpauth.BasicAuth(auth)(echoIdentity)
+
+	send := func(password string) int {
+		req := httptest.NewRequest(http.MethodGet, "/private", nil)
+		req.SetBasicAuth("alice", password)
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		return rec.Code
+	}
+
+	for range 2 {
+		if code := send("wrong"); code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", code)
+		}
+	}
+
+	if code := send("wrong"); code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429 once the account is in its cooldown", code)
+	}
+}

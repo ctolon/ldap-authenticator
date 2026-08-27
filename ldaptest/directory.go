@@ -111,6 +111,26 @@ type Directory struct {
 
 	// DialHook, if set, runs before a connection is created.
 	DialHook func(url string) error
+
+	// BindControlHook, if set, returns the controls a bind should be
+	// answered with.
+	//
+	// It is how a test produces the password policy control that
+	// OpenLDAP and 389 Directory Server use to say *why* a credential
+	// was refused — an expired password, a locked account, one that must
+	// be changed after a reset. Active Directory says the same thing in
+	// the error text and needs nothing here.
+	BindControlHook func(dn string) []ldap.Control
+
+	// ReferralHook, if set, returns the referral URLs a search should be
+	// answered with. Return none for an ordinary search.
+	//
+	// A referral is what a multi-domain Active Directory forest answers
+	// when the base DN names a partition that does not hold the object,
+	// and it is the failure mode most likely to be mistaken for "no such
+	// user". A fake with no way to produce one is a fake that cannot test
+	// the handling.
+	ReferralHook func(request *ldap.SearchRequest) []string
 }
 
 // New builds a directory holding the given entries.
@@ -321,6 +341,28 @@ func (c *conn) Bind(dn, password string) error {
 	return nil
 }
 
+// SimpleBind performs a bind and returns the response controls, which
+// makes this connection an [ldapauth.ControlBinder].
+//
+// The controls come back on the failure as well as on the success, and the
+// failure is the interesting one: that is where a directory says the
+// password was right but expired.
+func (c *conn) SimpleBind(request *ldap.SimpleBindRequest) (*ldap.SimpleBindResult, error) {
+	err := c.Bind(request.Username, request.Password)
+
+	c.dir.mu.Lock()
+	hook := c.dir.BindControlHook
+	c.dir.mu.Unlock()
+
+	result := &ldap.SimpleBindResult{}
+
+	if hook != nil {
+		result.Controls = hook(request.Username)
+	}
+
+	return result, err
+}
+
 func (c *conn) Search(request *ldap.SearchRequest) (*ldap.SearchResult, error) {
 	d := c.dir
 
@@ -339,6 +381,10 @@ func (c *conn) Search(request *ldap.SearchRequest) (*ldap.SearchResult, error) {
 		}
 	}
 
+	d.mu.Lock()
+	referrals := d.ReferralHook
+	d.mu.Unlock()
+
 	node, err := compileFilter(request.Filter)
 	if err != nil {
 		return nil, ldap.NewError(ldap.ErrorFilterCompile, err)
@@ -350,6 +396,10 @@ func (c *conn) Search(request *ldap.SearchRequest) (*ldap.SearchResult, error) {
 	d.mu.Unlock()
 
 	result := &ldap.SearchResult{}
+
+	if referrals != nil {
+		result.Referrals = referrals(request)
+	}
 
 	for _, entry := range entries {
 		if !inScope(entry.DN, request.BaseDN, request.Scope) {

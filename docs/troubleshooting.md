@@ -39,6 +39,45 @@ but "this cannot be a password". It exceeded `WithPasswordMaxLength`, which
 defaults to a kilobyte. Something upstream is putting a request body, or a
 token, into the password field.
 
+### `ldapauth: too many recent failures for this account`
+
+`WithLockoutProtection` is on and this process has refused that account
+often enough recently to stop asking the directory. The error says how long
+is left; over HTTP it is a 429.
+
+If it is happening to real users, either the window is too tight for your
+traffic or something is retrying with a stale credential. Look for the
+latter first — a mobile client with a saved password, a service with an old
+value in its configuration.
+
+If it is happening to one account repeatedly and nobody is complaining,
+that is the feature working: somebody is trying to lock that account out of
+the directory and this is stopping them.
+
+### `ldapauth: the directory referred the search elsewhere`
+
+`WithReferralPolicy(ReferralFail)` is on and the search came back with
+referrals and no entries. The user exists; they are in another partition.
+`AuthError.Referrals` says which:
+
+```go
+var authErr *ldapauth.AuthError
+if errors.As(err, &authErr) {
+    log.Println(authErr.Referrals)
+}
+```
+
+Almost always the base DN names the wrong domain in a forest. See
+[directories.md](directories.md) for the fix and for why this package will
+not follow the referral for you.
+
+### A user exists but "does not exist"
+
+On a multi-domain Active Directory forest, check for referrals before
+anything else. Turn on `WithReferralPolicy(ReferralFail)` for a moment: if
+the error changes from `invalid credentials` to `ErrReferral`, the account
+is in a partition your base DN does not cover.
+
 ### `ldapauth: no LDAP server available`
 
 Every configured URL failed to dial. The joined error underneath names each
@@ -71,6 +110,22 @@ ACL.
 The service account may not read what the configuration asks for.
 Frequently the group tree rather than the user tree: user search works,
 group resolution does not.
+
+### The login fails and nobody can say why
+
+Read the reason:
+
+```go
+log.Println(ldapauth.ReasonFor(err))
+```
+
+On Active Directory it is always there. On OpenLDAP and 389 Directory
+Server, add `WithPasswordPolicyControl()` and it will be, for expired
+passwords, locked accounts, and passwords that must be changed after a
+reset.
+
+An expired password is the common surprise: the credential is right, the
+user is certain it is right, and the directory says invalid credentials.
 
 ### The user authenticates but has no groups
 

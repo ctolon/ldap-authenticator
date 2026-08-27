@@ -41,6 +41,21 @@ type publicAPI struct {
 
 	AsPrincipal    func(ldapauth.Identity) (*ldapauth.Principal, bool)
 	NewMemoryCache func(int, func() time.Time) ldapauth.Cache
+	ReasonFor      func(error) ldapauth.RejectionReason
+
+	// Reloadable, added in 1.1.
+	NewReloadable     func(*ldapauth.Client) *ldapauth.Reloadable
+	ReloadableReplace func(*ldapauth.Reloadable, *ldapauth.Client) *ldapauth.Client
+	ReloadableCurrent func(*ldapauth.Reloadable) *ldapauth.Client
+	ReloadableAuth    func(*ldapauth.Reloadable, context.Context, string, string) (ldapauth.Identity, error)
+	ReloadableClose   func(*ldapauth.Reloadable) error
+
+	// RejectionReason, added in 1.1.
+	ReasonString     func(ldapauth.RejectionReason) string
+	ReasonActionable func(ldapauth.RejectionReason) bool
+
+	// ReferralPolicy, added in 1.1.
+	ReferralPolicyString func(ldapauth.ReferralPolicy) string
 
 	ErrorMessage func(*ldapauth.AuthError) string
 	ErrorUnwrap  func(*ldapauth.AuthError) error
@@ -77,6 +92,11 @@ type publicAPI struct {
 	WithServiceAccount       func(string, string) ldapauth.Option
 	WithAnonymousServiceBind func() ldapauth.Option
 
+	// Added in 1.1.
+	WithReferralPolicy        func(ldapauth.ReferralPolicy) ldapauth.Option
+	WithPasswordPolicyControl func() ldapauth.Option
+	WithLockoutProtection     func(int, time.Duration, time.Duration) ldapauth.Option
+
 	// Attributes.
 	WithUsernameAttribute    func(string) ldapauth.Option
 	WithDisplayNameAttribute func(string) ldapauth.Option
@@ -108,11 +128,12 @@ type publicAPI struct {
 	WithRetryMaxElapsed func(time.Duration) ldapauth.Option
 
 	// Cache.
-	WithCache         func(time.Duration) ldapauth.Option
-	WithNegativeCache func(time.Duration) ldapauth.Option
-	WithCacheSize     func(int) ldapauth.Option
-	WithCacheStore    func(ldapauth.Cache) ldapauth.Option
-	WithCacheSecret   func([]byte) ldapauth.Option
+	WithCache                func(time.Duration) ldapauth.Option
+	WithNegativeCache        func(time.Duration) ldapauth.Option
+	WithCacheSize            func(int) ldapauth.Option
+	WithCacheStore           func(ldapauth.Cache) ldapauth.Option
+	WithCacheSecret          func([]byte) ldapauth.Option
+	WithCacheUsernameHashing func() ldapauth.Option
 
 	// Pluggable behaviour.
 	WithPrincipalMapper func(ldapauth.PrincipalMapper) ldapauth.Option
@@ -158,6 +179,18 @@ func TestPublicAPIIsStable(t *testing.T) {
 
 		AsPrincipal:    ldapauth.AsPrincipal,
 		NewMemoryCache: ldapauth.NewMemoryCache,
+		ReasonFor:      ldapauth.ReasonFor,
+
+		NewReloadable:     ldapauth.NewReloadable,
+		ReloadableReplace: (*ldapauth.Reloadable).Replace,
+		ReloadableCurrent: (*ldapauth.Reloadable).Current,
+		ReloadableAuth:    (*ldapauth.Reloadable).Authenticate,
+		ReloadableClose:   (*ldapauth.Reloadable).Close,
+
+		ReasonString:     ldapauth.RejectionReason.String,
+		ReasonActionable: ldapauth.RejectionReason.Actionable,
+
+		ReferralPolicyString: ldapauth.ReferralPolicy.String,
 
 		ErrorMessage: (*ldapauth.AuthError).Error,
 		ErrorUnwrap:  (*ldapauth.AuthError).Unwrap,
@@ -191,6 +224,10 @@ func TestPublicAPIIsStable(t *testing.T) {
 		WithServiceAccount:       ldapauth.WithServiceAccount,
 		WithAnonymousServiceBind: ldapauth.WithAnonymousServiceBind,
 
+		WithReferralPolicy:        ldapauth.WithReferralPolicy,
+		WithPasswordPolicyControl: ldapauth.WithPasswordPolicyControl,
+		WithLockoutProtection:     ldapauth.WithLockoutProtection,
+
 		WithUsernameAttribute:    ldapauth.WithUsernameAttribute,
 		WithDisplayNameAttribute: ldapauth.WithDisplayNameAttribute,
 		WithEmailAttribute:       ldapauth.WithEmailAttribute,
@@ -217,11 +254,12 @@ func TestPublicAPIIsStable(t *testing.T) {
 		WithRetryBackoff:    ldapauth.WithRetryBackoff,
 		WithRetryMaxElapsed: ldapauth.WithRetryMaxElapsed,
 
-		WithCache:         ldapauth.WithCache,
-		WithNegativeCache: ldapauth.WithNegativeCache,
-		WithCacheSize:     ldapauth.WithCacheSize,
-		WithCacheStore:    ldapauth.WithCacheStore,
-		WithCacheSecret:   ldapauth.WithCacheSecret,
+		WithCache:                ldapauth.WithCache,
+		WithNegativeCache:        ldapauth.WithNegativeCache,
+		WithCacheSize:            ldapauth.WithCacheSize,
+		WithCacheStore:           ldapauth.WithCacheStore,
+		WithCacheSecret:          ldapauth.WithCacheSecret,
+		WithCacheUsernameHashing: ldapauth.WithCacheUsernameHashing,
 
 		WithPrincipalMapper: ldapauth.WithPrincipalMapper,
 		WithGroupResolver:   ldapauth.WithGroupResolver,
@@ -253,6 +291,8 @@ var (
 	_ ldapauth.Cache           = (ldapauth.Cache)(nil)
 	_ ldapauth.PrincipalMapper = (ldapauth.PrincipalMapper)(nil)
 	_ ldapauth.Searcher        = (ldapauth.Searcher)(nil)
+	_ ldapauth.Authenticator   = (*ldapauth.Reloadable)(nil)
+	_ ldapauth.ControlBinder   = (ldapauth.ControlBinder)(nil)
 )
 
 // The func adapters, which exist so that a caller can supply behaviour

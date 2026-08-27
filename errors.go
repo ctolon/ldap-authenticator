@@ -94,6 +94,20 @@ var (
 	// membership attribute is missing from an entry and strict group
 	// resolution is enabled.
 	ErrNoSuchGroupAttribute = errors.New("ldapauth: group membership attribute not present")
+
+	// ErrReferral reports a search that came back with referrals and no
+	// entries: the directory is saying the answer lives in another
+	// partition, which on a multi-domain Active Directory forest usually
+	// means the base DN names the wrong one. It is only returned under
+	// ReferralFail; see WithReferralPolicy.
+	ErrReferral = errors.New("ldapauth: the directory referred the search elsewhere")
+
+	// ErrTooManyAttempts reports a username this process has refused too
+	// often too recently, under WithLockoutProtection. The directory was
+	// not asked, which is the point: the attempt that would have been
+	// made is the attempt that would have counted against the directory's
+	// own lockout policy.
+	ErrTooManyAttempts = errors.New("ldapauth: too many recent failures for this account")
 )
 
 // AuthError carries the operational detail behind a failed operation:
@@ -123,6 +137,22 @@ type AuthError struct {
 	// say). Compare it against the ldap.LDAPResult* constants.
 	ResultCode uint16
 
+	// Reason is why the directory refused, when the directory said. It is
+	// ReasonUnspecified otherwise, which is most of the time on most
+	// directories.
+	//
+	// Log it, count it, audit it. Do not answer with it: the whole point
+	// of Authenticate returning one error for every refusal is that a
+	// caller cannot accidentally build an enumeration oracle, and putting
+	// the reason in a response body rebuilds one.
+	Reason RejectionReason
+
+	// Referrals are the referral URLs a search came back with, when it
+	// came back with referrals and nothing else. They are the directory
+	// saying "what you are looking for is not in this partition, try
+	// over there"; see WithReferralPolicy.
+	Referrals []string
+
 	// Err is the wrapped cause: always a sentinel from this package,
 	// possibly with the underlying *ldap.Error below it.
 	Err error
@@ -150,6 +180,12 @@ func (e *AuthError) Error() string {
 		fmt.Fprintf(&b, ": %s (%d)", ldap.LDAPResultCodeMap[e.ResultCode], e.ResultCode)
 	}
 
+	if e.Reason != ReasonUnspecified {
+		b.WriteString(" [")
+		b.WriteString(e.Reason.String())
+		b.WriteString("]")
+	}
+
 	if e.Err != nil {
 		b.WriteString(": ")
 		b.WriteString(e.Err.Error())
@@ -161,6 +197,36 @@ func (e *AuthError) Error() string {
 // Unwrap returns the wrapped cause so that errors.Is and errors.As reach
 // the sentinel and any *ldap.Error beneath it.
 func (e *AuthError) Unwrap() error { return e.Err }
+
+// enrich fills in what an outer layer knows and an inner one did not, and
+// returns the same error rather than a new one wrapping it.
+//
+// Wrapping an *AuthError in another *AuthError loses information in a way
+// that is easy to miss: errors.As stops at the outermost match, so a
+// Referrals or a Reason set deep down becomes unreachable while the error
+// still reads correctly. Enriching in place keeps one of these per
+// failure, which is also one per failure that a caller has to reason
+// about.
+func (e *AuthError) enrich(op, username string) *AuthError {
+	if e.Op == "" {
+		e.Op = op
+	}
+
+	if e.Username == "" {
+		e.Username = username
+	}
+
+	return e
+}
+
+// asAuthError reports whether an error already carries an *AuthError.
+func asAuthError(err error) (*AuthError, bool) {
+	var authErr *AuthError
+
+	ok := errors.As(err, &authErr)
+
+	return authErr, ok
+}
 
 // resultCode digs the LDAP result code out of an error chain, returning
 // zero when the failure never reached the protocol layer.

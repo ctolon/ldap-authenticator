@@ -56,7 +56,13 @@ jobs:
         with:
           results_file: results.sarif
           results_format: sarif
-          publish_results: true
+          # Publishing to the OpenSSF API only works on a scheduled run.
+          # Asking for it on a push does nothing except look like it
+          # worked, which is how a badge ends up reading "invalid repo
+          # path" while every run is green. The push run still uploads
+          # SARIF to code scanning, which is the part that is useful
+          # per-commit.
+          publish_results: ${{ github.event_name == 'schedule' }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scorecard-results

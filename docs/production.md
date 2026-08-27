@@ -205,6 +205,129 @@ directory.
   directory, but the directory is now taking the load the cache was there
   to absorb.
 
+## The layers around it
+
+At any scale worth calling scale, this package is the third layer down:
+
+```text
+application
+  ↓  rate limiter        per client — yours
+  ↓  circuit breaker     per directory — yours
+  ↓  ldap-authenticator  lockout protection, cache, coalescing, retry, failover
+  ↓  LDAP
+```
+
+Both outer layers are decorators over `ldapauth.Authenticator`, which is
+why that interface exists. [`examples/layered`](../examples/layered) is a
+working one of each, about sixty lines together.
+
+Neither belongs in the library, and the reason is the same for both: their
+policy is about your traffic rather than about your directory. A rate
+limiter's bucket is per IP or per session or per API key, with your
+thresholds and your idea of what to do when it trips. A breaker's
+thresholds are about your request volume. Every deployment already has an
+opinion and usually a library.
+
+**The breaker earns its place when the directory is completely down.**
+Without one, every request pays the whole chain — dial timeout, failover to
+the next URL, another dial timeout, retries with backoff — before failing.
+That is seconds of held goroutines per request, and under load it is how a
+directory outage becomes an application outage. With one, the first few
+requests pay it and the rest fail immediately.
+
+One thing to get right in a breaker over this package: **a rejected
+credential is a working directory.** Count only the failures that say the
+directory is unwell, or the first user to mistype their password opens the
+breaker for everybody.
+
+## Protecting the directory's lockout policy
+
+```go
+ldapauth.WithLockoutProtection(4, 5*time.Minute, time.Minute)
+```
+
+A directory that locks an account after five failures is a directory where
+anybody who knows a username can lock that account out — from anywhere, no
+access needed, and the victim is the one who calls the help desk. This
+package already refuses to make it worse by retrying a rejected credential.
+This stops it being the instrument: after four failures in five minutes,
+the account is refused locally for a minute and the attempts never reach
+the directory.
+
+Three things to know before turning it on.
+
+**It refuses the real user too.** That is the cost, and it is why this is
+not the default. With `WithCache` on, a user who logged in recently is
+served from cache and never reaches the throttle, which buys most of it
+back — see the ordering in [security.md](security.md).
+
+**It is per process.** Twenty replicas pass twenty times the threshold
+before all of them are blocking. Making it exact would mean a round trip to
+somewhere shared on every failed login, paid on the attack path.
+
+**It is not a rate limiter.** It counts failures per account, not requests
+per client. An attacker spreading attempts across a thousand accounts is
+limited by nothing here.
+
+Watch `Stats(ctx).BlockedAccounts`. A number that climbs is either an
+attack or a client with a stale credential, and both are worth a look.
+
+## Rotating the service account password
+
+The password is read once, when the Client is built. Rotating it means
+building a new Client and swapping the pointer, and
+[`ldapauth.Reloadable`](extending.md) is that:
+
+```go
+auth := ldapauth.NewReloadable(client)
+
+// when the secret manager says the password changed
+next, err := ldapauth.New(optionsWith(newPassword)...)
+if err != nil {
+    return err          // keep serving with the old one
+}
+
+previous := auth.Replace(next)
+previous.Close()
+```
+
+The ordering is the part people get wrong: close the old Client *after* the
+swap, never before. Closing it does not interrupt requests already running
+on it — they finish against connections closed as they are released — and
+by the time you call Close, nothing new is choosing it.
+
+[`examples/reloading`](../examples/reloading) does this under load and
+counts the failures. There are none.
+
+## Cache invalidation across replicas
+
+`InvalidateUser` empties the cache it is given. Which cache that is
+decides how far it reaches:
+
+| | `InvalidateUser` reaches | when an account is disabled |
+|---|---|---|
+| No cache | nothing to reach | takes effect immediately |
+| Local cache, one replica | that replica | immediate |
+| Local cache, twenty replicas | **the replica you called** | up to the TTL on the other nineteen |
+| Shared cache (`WithCacheStore`) | every replica | immediate |
+
+The third row is the one that bites. With local caches and twenty pods,
+disabling an account leaves nineteen of them still letting that account in
+until their TTLs expire — and there is no way for one pod to tell the
+others, short of you building the fan-out.
+
+Two answers, and they are both fine:
+
+- **Share the cache.** `WithCacheStore` plus `WithCacheSecret`, and
+  invalidation is immediate everywhere.
+- **Keep the TTL short enough that you do not care.** Thirty seconds of a
+  disabled account still working is a different conversation from an hour
+  of it. `MaxCacheTTL` caps it at five minutes regardless.
+
+What this package will not do is build a distributed invalidation channel.
+That is a message bus, and a library that shipped one would be a library
+with a message bus in it.
+
 ## What this library does not do for you
 
 Worth stating plainly, because each of these is a thing an operator has to
@@ -216,24 +339,22 @@ your HTTP server's business, and Basic auth over plaintext HTTP puts it on
 the wire in the clear no matter how carefully this package handles it
 afterwards.
 
-**Rate limiting and brute-force protection.** There is no counter here, and
-no lockout. `WithNegativeCache` keeps a client looping on one stale
-password away from the directory, and `httpauth.WithMinimumDuration` makes
-guessing slower — neither is a rate limiter. Put one in front, and know
-that the directory's own lockout policy is the thing an attacker can weapon
-against your users.
+**Rate limiting.** `WithLockoutProtection` counts failures per *account*,
+which protects the directory's lockout policy. It does not count requests
+per client, which is what stops brute force, and the two are different
+questions. Put a rate limiter in front; see the layering above.
 
 **Authorisation.** `Principal.Groups` is a list of names, or of DNs under
 `WithGroupDNs`. Deciding what a group is allowed to do is yours, and group
 *names* are not unique — two subtrees can each hold a `cn=admins`. If a
 rule matters, write it against a DN.
 
-**Secret rotation.** The service account password is read once, at
-construction. Rotating it means building a new authenticator and closing
-the old one; there is deliberately no way to change it underneath a running
-one, because that would put a lock around every field. The same goes for
-client certificates, unless you set `GetClientCertificate` through
-`WithTLSConfig`.
+**Secret rotation.** The mechanism is here —
+[`ldapauth.Reloadable`](extending.md) — but noticing that a secret changed
+is not. Watch the file, poll the secret manager, subscribe to whatever your
+platform offers, and call `Replace`. Client certificates are the same,
+unless you set `GetClientCertificate` through `WithTLSConfig`, which
+rotates them without a swap.
 
 **Rollback.** A Go module version is immutable once the proxy has seen it.
 Rolling back means pinning the previous version in your own `go.mod`, and

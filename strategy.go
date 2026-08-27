@@ -3,6 +3,7 @@ package ldapauth
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-ldap/ldap/v3"
 )
@@ -138,6 +139,10 @@ func (a *Client) searchUser(ctx context.Context, conn Conn, username string) (*l
 
 	result, err := a.search(ctx, conn, request)
 	if err != nil {
+		if inner, ok := asAuthError(err); ok {
+			return nil, inner.enrich("user search", a.cfg.safeUsername(username))
+		}
+
 		return nil, &AuthError{
 			Op:         "user search",
 			Username:   a.cfg.safeUsername(username),
@@ -221,7 +226,12 @@ func (a *Client) bindAs(ctx context.Context, dn, password string) (Conn, string,
 
 	a.cfg.metrics.ConnOpened(url)
 
-	if err := a.operate(ctx, conn, func() error { return conn.Bind(dn, password) }); err != nil {
+	var reason RejectionReason
+
+	err = a.operate(ctx, conn, func() error {
+		return a.bind(conn, dn, password, &reason)
+	})
+	if err != nil {
 		_ = conn.Close()
 		a.cfg.metrics.ConnClosed("error")
 
@@ -239,16 +249,63 @@ func (a *Client) bindAs(ctx context.Context, dn, password string) (Conn, string,
 			wrapped = fmt.Errorf("%w: %w", ErrInvalidCredentials, err)
 		}
 
+		if reason == ReasonUnspecified {
+			reason = reasonFromError(err)
+		}
+
 		return nil, url, &AuthError{
 			Op:         "bind",
 			URL:        url,
 			Username:   a.cfg.safeUsername(dn),
 			ResultCode: code,
+			Reason:     reason,
 			Err:        wrapped,
 		}
 	}
 
 	return conn, url, nil
+}
+
+// A ControlBinder is a [Conn] that can also return the controls a bind
+// produced.
+//
+// It is an optional interface rather than a method on Conn, because Conn
+// is part of the 1.x API and adding a method to it would break every
+// implementation that already exists. *ldap.Conn satisfies this one; a
+// custom transport may, and if it does not, the only thing lost is the
+// password policy control.
+type ControlBinder interface {
+	// SimpleBind performs a simple bind and returns the response
+	// controls, which is where a directory other than Active Directory
+	// says why it refused.
+	SimpleBind(request *ldap.SimpleBindRequest) (*ldap.SimpleBindResult, error)
+}
+
+// bind performs the simple bind, asking for the password policy control
+// when the configuration wants it and the connection can carry it.
+//
+// The control is what makes an expired password distinguishable from a
+// wrong one on OpenLDAP and its relatives; Active Directory says the same
+// thing in the error text instead, and needs nothing here.
+func (a *Client) bind(conn Conn, dn, password string, reason *RejectionReason) error {
+	binder, ok := conn.(ControlBinder)
+	if !a.cfg.passwordPolicyControl || !ok {
+		return conn.Bind(dn, password)
+	}
+
+	request := ldap.NewSimpleBindRequest(dn, password, []ldap.Control{
+		ldap.NewControlBeheraPasswordPolicy(),
+	})
+
+	result, err := binder.SimpleBind(request)
+
+	// The control comes back on the failure as well as on the success,
+	// and the failure is the interesting one.
+	if result != nil {
+		*reason = reasonFromControls(result.Controls)
+	}
+
+	return err
 }
 
 // search issues a search, paging it when the configuration asks for
@@ -272,7 +329,50 @@ func (a *Client) search(ctx context.Context, conn Conn, request *ldap.SearchRequ
 		return nil, err
 	}
 
+	if err := a.checkReferrals(request, result); err != nil {
+		return nil, err
+	}
+
 	return result, nil
+}
+
+// checkReferrals notices a search the directory answered with referrals
+// and nothing else.
+//
+// Referrals alongside entries are ordinary on Active Directory: a search
+// that crosses a partition boundary gets continuation references for the
+// parts it did not cover, and the entries it did return are still the
+// answer. Referrals *instead* of entries are different. They mean the
+// object is not in this partition, and on a forest that almost always
+// means the base DN names the wrong domain — a configuration mistake that
+// otherwise arrives as "no such user" and sends somebody hunting through
+// the directory for an account that is exactly where it should be.
+//
+// Chasing the referral is not on offer, and that is a decision rather than
+// an omission: following one means opening a connection to a host the
+// directory named and presenting the service account's password to it.
+// A directory that can be persuaded to emit a referral is then a directory
+// that can be persuaded to collect credentials. Point the base DN at the
+// right partition, or use the Global Catalog — see docs/directories.md.
+func (a *Client) checkReferrals(request *ldap.SearchRequest, result *ldap.SearchResult) error {
+	if len(result.Entries) > 0 || len(result.Referrals) == 0 {
+		return nil
+	}
+
+	a.warn("the directory referred the search elsewhere and returned nothing",
+		"base", request.BaseDN,
+		"referrals", result.Referrals,
+	)
+
+	if a.cfg.referralPolicy != ReferralFail {
+		return nil
+	}
+
+	return &AuthError{
+		Op:        "search",
+		Referrals: append([]string(nil), result.Referrals...),
+		Err:       fmt.Errorf("%w: %s", ErrReferral, strings.Join(result.Referrals, ", ")),
+	}
 }
 
 // withPooledConn runs fn on a service-account connection and returns it to

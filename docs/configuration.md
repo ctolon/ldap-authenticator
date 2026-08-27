@@ -52,6 +52,8 @@ Exactly one of these two. See [strategies.md](strategies.md).
 | `WithPagingSize(n)` | off | Active Directory truncates at 1000 and says nothing |
 | `WithServiceAccount(dn, password)` | — | needs read, never write, never `userPassword` |
 | `WithAnonymousServiceBind()` | off | must be asked for explicitly |
+| `WithReferralPolicy(p)` | `ReferralIgnore` | `ReferralFail` turns a referral-only answer into an error |
+| `WithPasswordPolicyControl()` | off | how a non-AD directory says *why* it refused |
 
 ## Attributes
 
@@ -118,7 +120,8 @@ Off by default. See [production.md](production.md) and
 | `WithNegativeCache(ttl)` | 5s | stops a stale password reaching a lockout policy |
 | `WithCacheSize(n)` | 4096 | |
 | `WithCacheStore(c)` | in-memory | for a cache shared between replicas |
-| `WithCacheSecret(b)` | random per process | required for a shared cache; is itself a secret |
+| `WithCacheSecret(b)` | random per process | required for a shared cache; is itself a credential |
+| `WithCacheUsernameHashing()` | off | the store sees a hash instead of the username |
 
 ## Input handling
 
@@ -128,6 +131,7 @@ Off by default. See [production.md](production.md) and
 | `WithPasswordMaxLength(n)` | 1024 | not about strength; about not carrying a megabyte |
 | `WithCaseFoldUsername()` | off | changes the cache key only, never what is sent |
 | `WithUsernameRedaction()` | off | `[redacted]` in logs and errors |
+| `WithLockoutProtection(n, window, cooldown)` | off | refuses locally so the directory's lockout counter never moves |
 
 ## Behaviour
 
@@ -143,6 +147,43 @@ Off by default. See [production.md](production.md) and
 | `WithLogger(l)` | discards | `*slog.Logger`; never sees a password |
 | `WithMetrics(m)` | no-op | embed `NoopMetrics` in yours |
 | `WithClock(now)` | `time.Now` | for tests; must be safe for concurrent use |
+
+## Reading a failure
+
+Everything a refusal knows, without changing what the caller is told.
+
+```go
+var authErr *ldapauth.AuthError
+if errors.As(err, &authErr) {
+    authErr.Op          // "bind", "user search", "group search", "throttle", "cache"
+    authErr.URL         // the server it was talking to
+    authErr.ResultCode  // the LDAP result code
+    authErr.Reason      // why the directory refused, when it said
+    authErr.Referrals   // where it said to look instead
+}
+
+ldapauth.ReasonFor(err)     // the reason without the type assertion
+```
+
+`RejectionReason` is a closed set — `ReasonBadPassword`,
+`ReasonPasswordExpired`, `ReasonAccountDisabled`, `ReasonAccountLocked`,
+`ReasonAccountExpired`, `ReasonPasswordMustChange`, `ReasonTimeRestricted`,
+`ReasonWorkstationRestricted`, `ReasonNoSuchUser`, `ReasonUnspecified` —
+so it is safe as a metrics label. `Actionable()` reports whether trying
+again with different credentials could help, which is the distinction a
+help desk cares about.
+
+## Rotating without a restart
+
+```go
+auth := ldapauth.NewReloadable(client)
+
+previous := auth.Replace(next)
+previous.Close()
+```
+
+`*Reloadable` implements `Authenticator`, so everything downstream is
+unaffected. See [production.md](production.md).
 
 ## Exported defaults
 

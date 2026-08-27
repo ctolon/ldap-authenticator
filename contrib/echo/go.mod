@@ -3,7 +3,7 @@ module github.com/ctolon/ldap-authenticator/contrib/echo
 go 1.25.0
 
 require (
-	github.com/ctolon/ldap-authenticator v1.0.0
+	github.com/ctolon/ldap-authenticator v1.1.0
 	github.com/labstack/echo/v4 v4.15.4
 )
 

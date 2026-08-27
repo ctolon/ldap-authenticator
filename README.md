@@ -3,8 +3,6 @@
 [![CI](https://github.com/ctolon/ldap-authenticator/actions/workflows/ci.yml/badge.svg)](https://github.com/ctolon/ldap-authenticator/actions/workflows/ci.yml)
 [![Security](https://github.com/ctolon/ldap-authenticator/actions/workflows/security.yml/badge.svg)](https://github.com/ctolon/ldap-authenticator/actions/workflows/security.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/ctolon/ldap-authenticator.svg)](https://pkg.go.dev/github.com/ctolon/ldap-authenticator)
-[![Go Report Card](https://goreportcard.com/badge/github.com/ctolon/ldap-authenticator)](https://goreportcard.com/report/github.com/ctolon/ldap-authenticator)
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/ctolon/ldap-authenticator/badge)](https://scorecard.dev/viewer/?uri=github.com/ctolon/ldap-authenticator)
 ![Go 1.25+](https://img.shields.io/badge/Go-1.25%2B-00ADD8)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -222,6 +220,9 @@ answer.
 - **No password is logged**, ever, and none is stored: the cache key is an
   HMAC under a random key, and a `Cache` implementation never sees a
   credential.
+- **This package will not walk an account into a lockout.** A rejected
+  credential is never retried, and `WithLockoutProtection` stops repeated
+  failures reaching the directory's own counter at all.
 
 Each of these has a test named after what it protects. Eleven fuzz targets
 assert the properties rather than the outputs — including three that drive
@@ -358,6 +359,8 @@ in-memory directory from `ldaptest` — except where a real URL is a flag.
 | | |
 |---|---|
 | [`examples/failover`](examples/failover) | a replica going away, and coming back |
+| [`examples/layered`](examples/layered) | rate limiter → circuit breaker → authenticator |
+| [`examples/reloading`](examples/reloading) | rotating the service account password without a restart |
 
 ## Documentation
 

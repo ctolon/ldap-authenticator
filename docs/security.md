@@ -207,12 +207,55 @@ including one that stores things in Redis, on another machine, for other
 replicas to read — never sees a credential.
 
 `WithCacheSecret` replaces the generated secret with one you supply, which
-is how several replicas agree on keys. It is a real secret: anybody holding
-it can test a guessed credential against the cache offline, without
-touching the directory and without the directory noticing. Keep it where
-you keep the service account password, and understand that a cache shared
-between two services makes one service's authentication decisions into the
-other's.
+is how several replicas agree on keys.
+
+### The shared cache secret is a credential
+
+Anybody holding it can do this:
+
+```text
+candidate password  →  HMAC(secret, username ‖ 0 ‖ candidate)  →  look it up
+```
+
+A hit means the guess was right. No bind, no directory, no failed-login
+counter, no log line — offline credential testing at whatever rate they can
+read the cache. It is not as good as having the password hashes, because
+they still need the cache and a username, but it is a great deal better
+than nothing and it is silent.
+
+What follows from that:
+
+- **A different secret from the LDAP bind password.** They protect
+  different things, and reusing one makes a compromise of either a
+  compromise of both.
+- **Thirty-two bytes.** That is what this package generates when you do not
+  supply one. Sixteen is the hard floor for compatibility, and anything
+  below thirty-two is logged as a warning at startup.
+- **Rotate it on the same schedule as the bind password.** Rotation costs
+  nothing but a cold cache: every key changes at once, so old entries
+  become unreachable rather than wrong.
+- **The store needs its own protections.** A Redis with no ACL and no TLS
+  is a Redis where the cache is readable by whoever is on the network, and
+  the secret only matters once somebody has the cache.
+
+And the boundary: a cache shared between two services makes one service's
+authentication decisions into the other's.
+
+### The username in the store
+
+The key hides the credential. The username travels beside it in the clear,
+because `InvalidateUser` has to find an account's entries without knowing
+the password — so a shared, remote, or backed-up store holds a list of who
+has logged in recently, which is personal data this package put there.
+
+```go
+ldapauth.WithCacheUsernameHashing()
+```
+
+replaces it with a keyed hash under the same secret. Invalidation still
+works, because it hashes the same way, and the store holds nothing anybody
+can read. What it costs is the ability to look in the cache and see who is
+in it, which is a real debugging affordance and the reason it is a choice.
 
 What caching costs is freshness: for the length of the TTL, a disabled
 account, a changed password, or a revoked group membership still works.
@@ -223,6 +266,44 @@ changed somebody's password and would rather not wait.
 Failures that are not about the credential — the directory was down, the
 context expired — are never cached. Caching those would serve the outage
 back to the caller for the length of the TTL.
+
+## Locking somebody out of their own account
+
+A directory that locks an account after five failed binds is a directory
+where anybody who knows a username can lock that account out. No access is
+needed, no guessing, and nothing about it looks like an attack from the
+directory's side — five wrong passwords is five wrong passwords. The victim
+is the one who calls the help desk.
+
+This package refuses to make it worse: a rejected credential is never
+retried, so one attempt from a caller is one attempt at the directory.
+
+`WithLockoutProtection` goes further and stops the attempts arriving:
+
+```go
+ldapauth.WithLockoutProtection(4, 5*time.Minute, time.Minute)
+```
+
+Four failures for one account within five minutes, and this process refuses
+that account locally for a minute without asking the directory. The
+directory's counter never moves.
+
+**The ordering matters, and it is deliberate.** The cache is consulted
+first, then the throttle. A user who authenticated a minute ago is served
+from cache and never reaches the throttle — so somebody guessing at their
+username does not lock them out of a session they already have. Without a
+cache there is nothing to serve them from and they are refused along with
+the attacker, which is a local cooldown of a minute rather than a directory
+lockout an administrator has to clear, but it is a real cost.
+
+**Only a refused credential counts.** A directory that was unreachable says
+nothing about whether the password was right, and counting it would mean an
+outage locking out everybody who tried to log in during it.
+
+**The counters are per process and per account.** Twenty replicas pass
+twenty times the threshold before all of them are blocking, and an attacker
+spreading attempts across a thousand accounts is limited by nothing here.
+It is not a rate limiter; put one in front.
 
 ## Coalescing
 
@@ -268,6 +349,34 @@ The in-memory directory those run against parses filters and DNs for real,
 so a passing run means the property held against a parser rather than
 against a string comparison. It has its own tests for the same reason: a
 fake that unescaped too eagerly would report every attack as harmless.
+
+## Why the directory refused
+
+`Authenticate` returns `ErrInvalidCredentials` for every refusal —
+wrong password, no such user, expired password, disabled account, locked
+account, logon-hour restriction. That is not laziness. A login form that
+could tell any of these apart is an account enumeration oracle; one that
+could tell "password expired" from "wrong password" tells an attacker the
+username is real and the account is live.
+
+The reason is still available, on the error, for the audience that is not
+the user:
+
+```go
+identity, err := auth.Authenticate(ctx, username, password)
+if err != nil {
+    audit.Record(username, ldapauth.ReasonFor(err))
+    return unauthorized()          // the same response, whatever the reason
+}
+```
+
+It comes from Active Directory's data code, always, and from the password
+policy control on other directories with `WithPasswordPolicyControl()`.
+
+**Do not put it in a response body.** Not in the message, not in an error
+code, not in a header, and not in a response time — if the expired-password
+path is slower than the wrong-password path, you have rebuilt the oracle
+out of timing. `httpauth.WithMinimumDuration` is what flattens that.
 
 ## What this library cannot do for you
 

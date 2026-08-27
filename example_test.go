@@ -407,3 +407,84 @@ func (b breakGlass) Authenticate(
 
 	return b.Authenticator.Authenticate(ctx, username, password)
 }
+
+// Why the directory refused, for the audit trail — while the caller still
+// gets the same answer whatever the reason.
+func ExampleReasonFor() {
+	auth, err := ldapauth.New(
+		ldapauth.WithURL("ldaps://dc1.example.com:636"),
+		ldapauth.WithDirectBind("uid={{username}},ou=people,dc=example,dc=com"),
+
+		// On OpenLDAP and 389 Directory Server this is what makes an
+		// expired password distinguishable. Active Directory needs
+		// nothing: it says so in the error text either way.
+		ldapauth.WithPasswordPolicyControl(),
+
+		ldapauth.WithDialer(exampleDirectory().Dialer()),
+	)
+	if err != nil {
+		fmt.Println("configuration:", err)
+
+		return
+	}
+	defer auth.Close()
+
+	_, err = auth.Authenticate(context.Background(), "alice", "wrong-password")
+
+	reason := ldapauth.ReasonFor(err)
+
+	// Record the reason. Answer with the error.
+	fmt.Println("audit:", reason, "actionable:", reason.Actionable())
+	fmt.Println("response:", errors.Is(err, ldapauth.ErrInvalidCredentials))
+	// Output:
+	// audit: unspecified actionable: true
+	// response: true
+}
+
+// Rotating the service account password without restarting the process.
+func ExampleNewReloadable() {
+	dir := exampleDirectory()
+
+	build := func() (*ldapauth.Client, error) {
+		return ldapauth.New(
+			ldapauth.WithURL("ldaps://dc1.example.com:636"),
+			ldapauth.WithDirectBind("uid={{username}},ou=people,dc=example,dc=com"),
+			ldapauth.WithDialer(dir.Dialer()),
+		)
+	}
+
+	client, err := build()
+	if err != nil {
+		fmt.Println("configuration:", err)
+
+		return
+	}
+
+	auth := ldapauth.NewReloadable(client)
+	defer auth.Close()
+
+	// When the secret manager says the password changed: build, check,
+	// swap, then close what was replaced. Never the other way round.
+	next, err := build()
+	if err != nil {
+		fmt.Println("reload failed, keeping the old client:", err)
+
+		return
+	}
+
+	previous := auth.Replace(next)
+
+	if err := previous.Close(); err != nil {
+		fmt.Println("closing the replaced client:", err)
+	}
+
+	identity, err := auth.Authenticate(context.Background(), "alice", "s3cret")
+	if err != nil {
+		fmt.Println("authentication:", err)
+
+		return
+	}
+
+	fmt.Println(identity.GetUsername())
+	// Output: alice
+}

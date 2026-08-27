@@ -192,6 +192,30 @@
 //
 // Every error wraps a sentinel, so errors.Is reaches it whatever the
 // detail. Failures that got as far as the protocol also carry an
-// [AuthError] with the step, the server, and the LDAP result code, which
-// errors.As will find.
+// [AuthError] with the step, the server, the LDAP result code, and — when
+// the directory said — a [RejectionReason] explaining why it refused.
+//
+// The reason is for your log and your audit trail, never for a response
+// body: Authenticate returns [ErrInvalidCredentials] for a wrong password,
+// an unknown user, an expired password and a disabled account alike,
+// because a caller that could tell them apart is an account enumeration
+// oracle. [ReasonFor] gets it without a type assertion.
+//
+// # Enterprise directories
+//
+// Three things that only come up on a real one, each with its own section
+// in the documentation:
+//
+// [WithReferralPolicy] decides what happens when a multi-domain forest
+// answers a search with "not in this partition, try over there". Following
+// the referral is not on offer — it would mean presenting the service
+// account's password to a host the directory named.
+//
+// [WithLockoutProtection] refuses an account locally after too many recent
+// failures, so that the attempts never reach the directory's own lockout
+// counter. Anybody who knows a username can otherwise lock that account
+// out by getting the password wrong five times.
+//
+// [NewReloadable] swaps the whole client, which is how the service account
+// password is rotated without restarting the process.
 package ldapauth

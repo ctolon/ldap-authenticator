@@ -62,26 +62,108 @@ error, which looks exactly like a user in no groups.
 *primary* group in it — usually `Domain Users`. If that matters, the
 matching rule does include it.
 
-**Referrals.** AD returns referrals for objects in other domains, and
-go-ldap does not chase them. Point the base DN at the domain you mean, or
-use the Global Catalog on port 3268 (`ldaps://` 3269) for a forest-wide
-read — but note that the Global Catalog holds a partial attribute set, so
-check that what you are reading is in it.
+## Referrals, and multi-domain forests
 
-**Account lockout.** AD counts failed binds and locks accounts. This
-package never retries a rejected credential for exactly that reason, and
-`WithNegativeCache` blunts a client looping on a stale password. What it
-cannot help with is a *disabled* account: AD answers a bind for one with
-`invalid credentials` and a `data 533` sub-code, which this package
-reports as `ErrInvalidCredentials` like any other rejection. Read
-`AuthError` if you need the distinction:
+A referral is the directory saying "not in this partition, try over there".
+On a single-domain deployment you will never see one. On a forest they are
+routine, and they are the failure mode most likely to waste a day.
+
+**Referrals alongside entries are normal.** A search that crosses a
+partition boundary comes back with continuation references for the parts it
+did not cover. The entries it did return are still the answer, and this
+package treats them that way.
+
+**Referrals instead of entries mean the base DN names the wrong
+partition.** The user exists; they are just not under the base you searched.
+Without help, that arrives as "no such user" and sends somebody hunting
+through the directory for an account sitting exactly where it should be.
+
+```go
+ldapauth.WithReferralPolicy(ldapauth.ReferralFail)
+```
+
+turns that into `ErrReferral`, with the URLs on the `AuthError`:
 
 ```go
 var authErr *ldapauth.AuthError
-if errors.As(err, &authErr) {
-    log.Println(authErr.ResultCode, authErr.Err)   // the sub-code is in the wrapped text
+if errors.As(err, &authErr) && errors.Is(err, ldapauth.ErrReferral) {
+    log.Printf("base DN is in the wrong partition; the directory suggests %v", authErr.Referrals)
 }
 ```
+
+The default is to ignore them and log a warning, because that is what every
+version of this package has done and changing it would break deployments
+that upgrade. Turn it on once you are confident your base DNs are right, so
+that the day they stop being right you are told.
+
+**This package does not follow referrals, and will not.** Following one
+means opening a connection to a host the directory named and presenting the
+service account's password to it. A directory that can be persuaded to
+return a referral is then a directory that can be persuaded to collect
+credentials, and "the directory told us to" is not a trust boundary. The
+supported answers are:
+
+- **Point the base DN at the right partition.** Usually the fix.
+- **Use the Global Catalog** for a forest-wide search: port 3268, or 3269
+  for `ldaps://`. One search covers every domain. The catch is that the GC
+  holds a *partial* attribute set — check that the attributes you read are
+  replicated to it, because `memberOf` is and plenty of custom attributes
+  are not.
+- **Configure one authenticator per domain** and try them in turn, if the
+  user population is genuinely split and you need full attributes. That is
+  a decorator over `ldapauth.Authenticator`; see
+  [extending.md](extending.md).
+
+A note on the Global Catalog and groups: a GC search sees group membership
+across the forest, which is the whole reason to use it, but universal
+groups only. Domain-local groups are not in the GC, so an authorisation
+rule written against one will silently never match.
+
+## Why Active Directory refused
+
+AD answers every refused bind with `invalid credentials`, and puts the real
+reason in the error text as a hexadecimal code. This package reads it, and
+puts it on the error as a [`RejectionReason`](configuration.md):
+
+```go
+identity, err := auth.Authenticate(ctx, username, password)
+if err != nil {
+    audit.Record(username, ldapauth.ReasonFor(err))   // password-expired, account-disabled, ...
+    return unauthorized()                             // the same answer, whatever the reason
+}
+```
+
+| AD code | reason | actionable |
+|---|---|---|
+| `525` | `ReasonNoSuchUser` | yes |
+| `52e` | `ReasonBadPassword` | yes |
+| `530` | `ReasonTimeRestricted` | no |
+| `531` | `ReasonWorkstationRestricted` | no |
+| `532` | `ReasonPasswordExpired` | no |
+| `533` | `ReasonAccountDisabled` | no |
+| `701` | `ReasonAccountExpired` | no |
+| `773` | `ReasonPasswordMustChange` | no |
+| `775` | `ReasonAccountLocked` | no |
+
+"Actionable" means trying again with different credentials might work. It
+is the distinction a help desk cares about, and a rise in unactionable
+refusals is an operational event rather than an attack.
+
+**Send the user the same response regardless.** `Authenticate` returns
+`ErrInvalidCredentials` for every one of these on purpose: a login form
+that could tell "password expired" from "wrong password" is a slower
+account enumeration oracle, but it is still one. The reason is for your
+log, your audit trail, and your metric label.
+
+For OpenLDAP and 389 Directory Server the same information arrives through
+the password policy control, with `WithPasswordPolicyControl()`. AD needs
+nothing extra.
+
+**Account lockout.** AD counts failed binds and locks accounts, which means
+anybody who knows a username can lock it out. This package never retries a
+rejected credential for exactly that reason, and
+`WithLockoutProtection` stops the attempts reaching the directory at all —
+see [security.md](security.md).
 
 ## OpenLDAP
 

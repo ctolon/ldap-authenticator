@@ -22,6 +22,12 @@ type Stats struct {
 	// PoolIdle is how many are open and waiting.
 	PoolIdle int
 
+	// BlockedAccounts is how many accounts are inside a local lockout
+	// cooldown, or zero when WithLockoutProtection is off. A number that
+	// climbs is either an attack on those accounts or a client with a
+	// stale credential; both are worth a look.
+	BlockedAccounts int
+
 	// CacheEntries is how many outcomes are cached, or zero when caching
 	// is off. It counts cached failures as well as cached successes.
 	CacheEntries int

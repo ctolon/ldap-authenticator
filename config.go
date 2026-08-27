@@ -97,6 +97,19 @@ const (
 	// cache rather than a memory leak with good manners.
 	DefaultCacheMaxEntries = 4096
 
+	// DefaultLockoutWindow is how long failures are counted over by
+	// WithLockoutProtection.
+	DefaultLockoutWindow = 5 * time.Minute
+
+	// DefaultLockoutCooldown is how long an account is refused locally
+	// once the threshold is reached.
+	DefaultLockoutCooldown = time.Minute
+
+	// DefaultLockoutMaxAccounts bounds how many accounts the throttle
+	// tracks. The keys come from a login form, so the bound is what stops
+	// somebody inventing usernames until the process runs out of memory.
+	DefaultLockoutMaxAccounts = 4096
+
 	// DefaultUsernameMaxLength is the longest username accepted before the
 	// request is rejected unread.
 	DefaultUsernameMaxLength = 256
@@ -197,6 +210,13 @@ type config struct {
 	// here.
 	anonymousService bool
 
+	// passwordPolicyControl asks for the RFC-draft password policy
+	// control on binds, which is how a directory other than Active
+	// Directory says why it refused.
+	passwordPolicyControl bool
+
+	referralPolicy ReferralPolicy
+
 	userBaseDN string
 
 	userFilter template
@@ -260,6 +280,19 @@ type config struct {
 	poolHealthCheck bool
 
 	cacheEnabled bool
+
+	// hashCacheUsernames sends the store a keyed hash of the username
+	// instead of the username, so that a shared store holds no personal
+	// data at all.
+	hashCacheUsernames bool
+
+	// throttle* configure the local lockout protection. attempts of zero
+	// leaves it off.
+	throttleAttempts int
+
+	throttleWindow time.Duration
+
+	throttleCooldown time.Duration
 
 	// cacheStore replaces the in-memory cache; see WithCacheStore.
 	cacheStore Cache
@@ -516,6 +549,10 @@ func (c *config) validateStrategy() error {
 		return fmt.Errorf("%w: user search scope %d is not a valid LDAP scope", ErrInvalidOption, c.userScope)
 	}
 
+	if !c.referralPolicy.valid() {
+		return fmt.Errorf("%w: referral policy %d is not valid", ErrInvalidOption, int(c.referralPolicy))
+	}
+
 	return nil
 }
 
@@ -611,6 +648,27 @@ func (c *config) validateLimits() error {
 	if !c.cacheEnabled && (c.cacheStore != nil || len(c.cacheSecret) > 0) {
 		return fmt.Errorf(
 			"%w: a cache store or secret is configured but caching is off; WithCache turns it on",
+			ErrInvalidOption,
+		)
+	}
+
+	if c.throttleAttempts < 0 {
+		return fmt.Errorf("%w: lockout attempts %d is negative", ErrInvalidOption, c.throttleAttempts)
+	}
+
+	if c.throttleAttempts > 0 {
+		if c.throttleWindow <= 0 {
+			return fmt.Errorf("%w: lockout window %s is not positive", ErrInvalidOption, c.throttleWindow)
+		}
+
+		if c.throttleCooldown <= 0 {
+			return fmt.Errorf("%w: lockout cooldown %s is not positive", ErrInvalidOption, c.throttleCooldown)
+		}
+	}
+
+	if c.hashCacheUsernames && !c.cacheEnabled {
+		return fmt.Errorf(
+			"%w: cache username hashing is configured but caching is off; WithCache turns it on",
 			ErrInvalidOption,
 		)
 	}

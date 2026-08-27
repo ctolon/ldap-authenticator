@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -80,6 +81,9 @@ type Client struct {
 	// It is nil when there is no cache, because without one every request
 	// is meant to reach the directory.
 	flights *inflight
+
+	// throttle is nil unless WithLockoutProtection was given.
+	throttle *throttle
 
 	mapper PrincipalMapper
 
@@ -168,6 +172,16 @@ func New(opts ...Option) (*Client, error) {
 		return nil, err
 	}
 
+	if cfg.throttleAttempts > 0 {
+		a.throttle = newThrottle(
+			cfg.throttleAttempts,
+			cfg.throttleWindow,
+			cfg.throttleCooldown,
+			DefaultLockoutMaxAccounts,
+			cfg.now,
+		)
+	}
+
 	a.mapper = cfg.mapper
 	if a.mapper == nil {
 		a.mapper = defaultMapper{cfg: cfg}
@@ -176,6 +190,13 @@ func New(opts ...Option) (*Client, error) {
 	a.groups = cfg.groupResolver
 	if a.groups == nil {
 		a.groups = &directoryGroups{cfg: cfg}
+	}
+
+	if len(cfg.cacheSecret) > 0 && len(cfg.cacheSecret) < recommendedCacheSecret {
+		a.warn("the cache secret is shorter than recommended",
+			"bytes", len(cfg.cacheSecret),
+			"recommended", recommendedCacheSecret,
+		)
 	}
 
 	a.info("ldap authenticator ready",
@@ -219,6 +240,11 @@ func (a *Client) initCache(cfg *config) error {
 
 	return nil
 }
+
+// recommendedCacheSecret is 256 bits. Anything shorter still works; it is
+// worth saying so out loud, because the secret is what stands between a
+// stolen cache and offline credential testing.
+const recommendedCacheSecret = 32
 
 func defaultTLSConfig(cfg *config) *tls.Config {
 	if cfg.tlsConfig != nil {
@@ -282,11 +308,24 @@ func (a *Client) authenticate(ctx context.Context, username, password string) (I
 	defer cancel()
 
 	if a.cache == nil {
-		return a.attempt(ctx, username, password)
+		if err := a.checkThrottle(username); err != nil {
+			return nil, err
+		}
+
+		identity, err := a.attempt(ctx, username, password)
+
+		a.recordAttempt(username, err)
+
+		return identity, err
 	}
 
 	key := a.cacheKey(username, password)
 
+	// The cache is consulted before the throttle, on purpose. A user who
+	// authenticated a minute ago should not be locked out of their own
+	// session because somebody else spent that minute guessing at their
+	// username — and the cached answer costs the directory nothing, which
+	// is what the throttle is protecting.
 	if identity, hit := a.fromCache(ctx, key); hit {
 		if identity == nil {
 			return nil, &AuthError{
@@ -297,6 +336,10 @@ func (a *Client) authenticate(ctx context.Context, username, password string) (I
 		}
 
 		return identity, nil
+	}
+
+	if err := a.checkThrottle(username); err != nil {
+		return nil, err
 	}
 
 	// Everything that reaches the directory goes through here, so that a
@@ -320,6 +363,7 @@ func (a *Client) authenticate(ctx context.Context, username, password string) (I
 		identity, err := a.attempt(work, username, password)
 
 		a.remember(work, key, username, identity, err)
+		a.recordAttempt(username, err)
 
 		return identity, err
 	})
@@ -585,7 +629,7 @@ func (a *Client) InvalidateUser(ctx context.Context, username string) (int, erro
 		return 0, nil
 	}
 
-	return a.cache.InvalidateUser(ctx, username)
+	return a.cache.InvalidateUser(ctx, a.storedUsername(username))
 }
 
 // InvalidateAll empties the cache and reports how many entries it dropped.
@@ -622,6 +666,10 @@ func (a *Client) Stats(ctx context.Context) Stats {
 	if a.pool != nil {
 		s.PoolInUse, s.PoolIdle = a.pool.stats()
 		s.PoolSize = a.cfg.poolSize
+	}
+
+	if a.throttle != nil {
+		s.BlockedAccounts = a.throttle.blocked()
 	}
 
 	if a.cache == nil {
@@ -714,6 +762,48 @@ func (a *Client) cacheKey(username, password string) string {
 	return string(mac.Sum(nil))
 }
 
+// checkThrottle refuses an account this process has seen fail too often
+// too recently, without asking the directory.
+func (a *Client) checkThrottle(username string) error {
+	if a.throttle == nil {
+		return nil
+	}
+
+	if ok, retryAfter := a.throttle.allow(username); !ok {
+		a.warn("refusing locally to protect the directory's lockout policy",
+			"username", a.cfg.safeUsername(username),
+			"retry_after", retryAfter,
+		)
+
+		return &AuthError{
+			Op:       "throttle",
+			Username: a.cfg.safeUsername(username),
+			Err:      fmt.Errorf("%w: try again in %s", ErrTooManyAttempts, retryAfter.Round(time.Second)),
+		}
+	}
+
+	return nil
+}
+
+// recordAttempt tells the throttle how an attempt that reached the
+// directory turned out.
+//
+// Only a refused credential counts. A directory that was unreachable says
+// nothing about whether the password was right, and counting it would mean
+// an outage locking out every account that tried to log in during it.
+func (a *Client) recordAttempt(username string, err error) {
+	if a.throttle == nil {
+		return
+	}
+
+	switch {
+	case err == nil:
+		a.throttle.succeed(username)
+	case errors.Is(err, ErrInvalidCredentials):
+		a.throttle.fail(username)
+	}
+}
+
 func (a *Client) fromCache(ctx context.Context, key string) (Identity, bool) {
 	identity, hit, err := a.cache.Get(ctx, key)
 	if err != nil {
@@ -750,9 +840,9 @@ func (a *Client) remember(ctx context.Context, key, username string, identity Id
 
 	switch {
 	case err == nil:
-		cerr = a.cache.Set(ctx, key, username, identity, a.cfg.cacheTTL)
+		cerr = a.cache.Set(ctx, key, a.storedUsername(username), identity, a.cfg.cacheTTL)
 	case errors.Is(err, ErrInvalidCredentials):
-		cerr = a.cache.Set(ctx, key, username, nil, a.cfg.cacheNegativeTTL)
+		cerr = a.cache.Set(ctx, key, a.storedUsername(username), nil, a.cfg.cacheNegativeTTL)
 	default:
 		return
 	}
@@ -775,12 +865,41 @@ func (a *Client) cacheName(username string) string {
 	return username
 }
 
+// storedUsername is the username as the cache store sees it.
+//
+// The key already hides the credential, but the username is passed
+// alongside it in the clear so that InvalidateUser can find an account's
+// entries without knowing the password. On a store that is shared,
+// remote, or backed up, that username is personal data this package put
+// there. WithCacheUsernameHashing replaces it with a keyed hash under the
+// same secret: InvalidateUser still works, because it hashes the same way,
+// and the store holds nothing anybody can read.
+//
+// What it costs is the ability to look in the cache and see who is in it,
+// which is a real debugging affordance and the reason this is a choice
+// rather than the default.
+func (a *Client) storedUsername(username string) string {
+	folded := a.cacheName(username)
+
+	if !a.cfg.hashCacheUsernames {
+		return folded
+	}
+
+	mac := hmac.New(sha256.New, a.cacheSecret)
+	mac.Write([]byte("username\x00"))
+	mac.Write([]byte(folded))
+
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 func resultLabel(err error) string {
 	switch {
 	case err == nil:
 		return ResultSuccess
 	case errors.Is(err, ErrInvalidCredentials):
 		return ResultInvalidCredentials
+	case errors.Is(err, ErrTooManyAttempts):
+		return ResultThrottled
 	case errors.Is(err, ErrEmptyPassword),
 		errors.Is(err, ErrEmptyUsername),
 		errors.Is(err, ErrInvalidUsername),
