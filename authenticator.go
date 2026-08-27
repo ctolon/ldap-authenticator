@@ -152,7 +152,7 @@ func New(opts ...Option) (*Client, error) {
 	}
 
 	if cfg.searchesDirectory() && (cfg.serviceDN != "" || cfg.anonymousService) {
-		a.pool = newPool(cfg, a.dialer, a.servers)
+		a.pool = newPool(ctx, cfg, a.dialer, a.servers)
 
 		if cfg.poolMinIdle > 0 {
 			// Warming happens in the background, and its failures are the
@@ -475,7 +475,7 @@ func (a *Client) lookupOnce(ctx context.Context, username string) (*resolved, er
 		dn := a.cfg.bindDN.expand(escapeDNValue, map[string]string{placeholderUsername: username})
 
 		entry, err := a.withPooledConn(ctx, func(conn Conn) (*ldap.Entry, error) {
-			return a.readEntry(conn, dn)
+			return a.readEntry(ctx, conn, dn)
 		})
 		if err != nil {
 			if ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
@@ -493,7 +493,7 @@ func (a *Client) lookupOnce(ctx context.Context, username string) (*resolved, er
 	}
 
 	entry, err := a.withPooledConn(ctx, func(conn Conn) (*ldap.Entry, error) {
-		return a.searchUser(conn, username)
+		return a.searchUser(ctx, conn, username)
 	})
 	if err != nil {
 		// searchUser reports a missing user as invalid credentials, which
@@ -530,7 +530,11 @@ func (a *Client) HealthCheck(ctx context.Context) error {
 			return err
 		}
 
-		_, err = conn.WhoAmI(nil)
+		err = a.operate(ctx, conn, func() error {
+			_, werr := conn.WhoAmI(nil)
+
+			return werr
+		})
 
 		a.pool.release(conn, err)
 
@@ -556,7 +560,12 @@ func (a *Client) HealthCheck(ctx context.Context) error {
 	// An anonymous Who Am I is refused by plenty of directories, and that
 	// refusal still proves the thing worth proving: the server is up,
 	// reachable, and speaking LDAP. Only a transport failure counts.
-	if _, err := conn.WhoAmI(nil); err != nil && resultCode(err) == 0 {
+	err = a.operate(ctx, conn, func() error {
+		_, werr := conn.WhoAmI(nil)
+
+		return werr
+	})
+	if err != nil && resultCode(err) == 0 {
 		return fmt.Errorf("ldapauth: health check on %s: %w", url, err)
 	}
 
@@ -568,6 +577,10 @@ func (a *Client) HealthCheck(ctx context.Context) error {
 // group memberships, rather than waiting out the TTL. It is a no-op when
 // caching is off.
 func (a *Client) InvalidateUser(ctx context.Context, username string) (int, error) {
+	if err := a.alive(); err != nil {
+		return 0, err
+	}
+
 	if a.cache == nil {
 		return 0, nil
 	}
@@ -577,6 +590,10 @@ func (a *Client) InvalidateUser(ctx context.Context, username string) (int, erro
 
 // InvalidateAll empties the cache and reports how many entries it dropped.
 func (a *Client) InvalidateAll(ctx context.Context) (int, error) {
+	if err := a.alive(); err != nil {
+		return 0, err
+	}
+
 	if a.cache == nil {
 		return 0, nil
 	}
@@ -591,6 +608,11 @@ func (a *Client) InvalidateAll(ctx context.Context) (int, error) {
 // The context is there for the cache, which may live somewhere else. A
 // cache that cannot answer leaves CacheEntries at -1 rather than failing
 // the call: a debug endpoint should not go down because Redis did.
+//
+// Stats is the one method that still answers after Close. It reports the
+// last state rather than an error, because the caller is a metrics scrape
+// or a debug handler and neither of them has anything useful to do with
+// ErrClosed while the process is on its way out.
 func (a *Client) Stats(ctx context.Context) Stats {
 	s := Stats{
 		Servers:        len(a.cfg.urls),
@@ -622,7 +644,14 @@ func (a *Client) Stats(ctx context.Context) Stats {
 
 // Close releases the pooled connections. Calls already in flight are not
 // interrupted; they finish against connections that are closed on release.
-// Close is idempotent, and every method returns ErrClosed afterwards.
+//
+// Close is idempotent, and every method afterwards returns ErrClosed —
+// except Stats, which reports the last state, because a metrics scrape has
+// nothing useful to do with an error while the process is shutting down.
+//
+// The cache is deliberately not emptied. A shared one belongs to whoever
+// owns it, and one replica's shutdown has no business throwing away
+// another's entries.
 func (a *Client) Close() error {
 	var err error
 
@@ -634,14 +663,11 @@ func (a *Client) Close() error {
 			err = a.pool.close()
 		}
 
-		if a.cache != nil {
-			// Best effort, and deliberately not fatal: a shared cache is
-			// not this process's to empty, and a local one is about to be
-			// garbage anyway.
-			if _, cerr := a.cache.InvalidateAll(context.Background()); cerr != nil {
-				a.debug("cache could not be emptied on close", "error", cerr)
-			}
-		}
+		// The cache is deliberately left alone. A shared one belongs to
+		// whoever owns it, and emptying it here would let one replica's
+		// shutdown throw away every other replica's entries — and block
+		// the shutdown on a round trip to do it. A local one is about to
+		// be garbage anyway.
 
 		a.info("ldap authenticator closed")
 	})
@@ -757,7 +783,8 @@ func resultLabel(err error) string {
 		return ResultInvalidCredentials
 	case errors.Is(err, ErrEmptyPassword),
 		errors.Is(err, ErrEmptyUsername),
-		errors.Is(err, ErrInvalidUsername):
+		errors.Is(err, ErrInvalidUsername),
+		errors.Is(err, ErrInvalidPassword):
 		return ResultRejected
 	default:
 		return ResultError

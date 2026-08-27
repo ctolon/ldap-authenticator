@@ -1,7 +1,9 @@
 package httpauth_test
 
 import (
+	"bytes"
 	"errors"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -403,5 +405,119 @@ func TestPrincipalIsAbsentWithoutTheMiddleware(t *testing.T) {
 
 	if _, ok := httpauth.IdentityFrom(req.Context()); ok {
 		t.Fatal("a principal appeared in a context that never went through the middleware")
+	}
+}
+
+func TestLoginHandlerAcceptsMultipart(t *testing.T) {
+	t.Parallel()
+
+	// ParseForm does not parse a multipart body, so the multipart support
+	// this package documented used to return empty fields for every
+	// request.
+	var body bytes.Buffer
+
+	writer := multipart.NewWriter(&body)
+
+	for field, value := range map[string]string{"username": "alice", "password": "alice-pw"} {
+		if err := writer.WriteField(field, value); err != nil {
+			t.Fatalf("writing %s: %v", field, err)
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("closing the multipart writer: %v", err)
+	}
+
+	handler := httpauth.LoginHandler(newAuth(t),
+		func(w http.ResponseWriter, _ *http.Request, identity ldapauth.Identity) {
+			_, _ = w.Write([]byte(identity.GetUsername()))
+		},
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/login", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK || rec.Body.String() != "alice" {
+		t.Fatalf("status = %d body = %q, want a successful multipart login", rec.Code, rec.Body.String())
+	}
+}
+
+func TestJSONTrailingContentIsRejected(t *testing.T) {
+	t.Parallel()
+
+	// Decode stops at the end of the first value, so a body with a second
+	// object behind the credentials used to be accepted.
+	handler := httpauth.LoginHandler(newAuth(t),
+		func(http.ResponseWriter, *http.Request, ldapauth.Identity) {
+			t.Error("the success handler ran for a body with trailing content")
+		},
+	)
+
+	body := `{"username":"alice","password":"alice-pw"}{"username":"root"}`
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestAnOversizedJSONBodyIsRejectedRatherThanTruncated(t *testing.T) {
+	t.Parallel()
+
+	// A LimitReader truncates, so a valid object inside the limit used to
+	// be accepted with anything at all behind it. A MaxBytesReader errors.
+	handler := httpauth.LoginHandler(newAuth(t),
+		func(http.ResponseWriter, *http.Request, ldapauth.Identity) {
+			t.Error("the success handler ran for an oversized body")
+		},
+		httpauth.WithMaxBodyBytes(64),
+	)
+
+	body := `{"username":"alice","password":"alice-pw"}` + strings.Repeat(" ", 4096)
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusOK {
+		t.Fatal("an oversized body was truncated and accepted")
+	}
+}
+
+func TestPolicyAccessorsReportWhatTheAdaptersNeed(t *testing.T) {
+	t.Parallel()
+
+	policy, err := httpauth.NewPolicy(
+		httpauth.WithMaxBodyBytes(1234),
+		httpauth.WithSkip(func(r *http.Request) bool { return r.URL.Path == "/healthz" }),
+	)
+	if err != nil {
+		t.Fatalf("NewPolicy: %v", err)
+	}
+
+	if got := policy.MaxBodyBytes(); got != 1234 {
+		t.Errorf("MaxBodyBytes = %d, want 1234", got)
+	}
+
+	if !policy.ShouldSkip(httptest.NewRequest(http.MethodGet, "/healthz", nil)) {
+		t.Error("ShouldSkip = false for a path the predicate skips")
+	}
+
+	if policy.ShouldSkip(httptest.NewRequest(http.MethodGet, "/private", nil)) {
+		t.Error("ShouldSkip = true for a path the predicate does not skip")
+	}
+
+	// An adapter with no *http.Request — Fiber — must get a usable answer
+	// rather than a panic.
+	if policy.ShouldSkip(nil) {
+		t.Error("ShouldSkip(nil) = true")
 	}
 }

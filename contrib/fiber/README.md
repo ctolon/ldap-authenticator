@@ -80,6 +80,10 @@ consequences worth knowing:
 - **`httpauth.WithSkip` and `httpauth.WithErrorHandler` do nothing**, because
   both take an `*http.Request` and there is not one. Skip with Fiber's own
   routing, and shape errors with a Fiber error handler.
+- **`httpauth.WithMaxBodyBytes` is applied**, but after the fact: Fiber has
+  already read the body into memory by the time this adapter can measure
+  it. Set `fiber.Config.BodyLimit` to the same number, which is what
+  actually bounds the allocation.
 - **The context for the authentication is `c.UserContext()`.** Set it if you
   want a deadline or a trace to reach the directory.
 - **This module does not build for the wasm targets** that the rest of the

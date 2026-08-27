@@ -100,7 +100,7 @@ func Middleware(auth ldapauth.Authenticator, policy *Policy) func(http.Handler) 
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if policy.skip != nil && policy.skip(r) {
+			if policy.ShouldSkip(r) {
 				next.ServeHTTP(w, r)
 
 				return
@@ -164,7 +164,7 @@ func LoginHandler(
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		username, password, err := Credentials(r, policy.maxBody)
+		username, password, err := Credentials(r, policy.MaxBodyBytes())
 		if err != nil {
 			policy.Reject(w, r, err)
 
@@ -202,29 +202,85 @@ func Credentials(r *http.Request, maxBody int64) (username, password string, err
 
 	switch strings.TrimSpace(strings.ToLower(contentType)) {
 	case "application/json", "text/json":
-		var body struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-		}
+		return jsonCredentials(r, maxBody)
 
-		decoder := json.NewDecoder(io.LimitReader(r.Body, maxBody))
+	case "application/x-www-form-urlencoded":
+		return formCredentials(r, maxBody)
 
-		if err := decoder.Decode(&body); err != nil {
-			return "", "", ErrMalformedRequest
-		}
-
-		return body.Username, body.Password, nil
-
-	case "application/x-www-form-urlencoded", "multipart/form-data":
-		r.Body = http.MaxBytesReader(nil, r.Body, maxBody)
-
-		if err := r.ParseForm(); err != nil {
-			return "", "", ErrMalformedRequest
-		}
-
-		return r.PostFormValue("username"), r.PostFormValue("password"), nil
+	case "multipart/form-data":
+		return multipartCredentials(r, maxBody)
 
 	default:
 		return "", "", ErrNoCredentials
 	}
+}
+
+// jsonCredentials decodes a JSON object, and insists that the object is
+// the whole body.
+//
+// Two details, both of which this package got wrong before v1.0. The
+// reader is a MaxBytesReader rather than a LimitReader, because a
+// LimitReader *truncates*: a body over the limit is silently cut, and a
+// valid object in the first 64 KiB is accepted with a gigabyte of anything
+// behind it. And the decoder is asked whether more follows, because
+// Decode stops at the end of the first value and would otherwise accept
+// `{"username":"a","password":"b"}` with a second object after it.
+func jsonCredentials(r *http.Request, maxBody int64) (string, string, error) {
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+
+	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxBody))
+
+	if err := decoder.Decode(&body); err != nil {
+		return "", "", ErrMalformedRequest
+	}
+
+	// Token rather than More, because More reports whether another value
+	// follows and throws away the error it found out with — including
+	// "request body too large". Reading for the next token is what turns
+	// an oversized body into a rejection instead of a silent acceptance of
+	// whatever fitted inside the limit.
+	switch _, err := decoder.Token(); {
+	case errors.Is(err, io.EOF):
+		return body.Username, body.Password, nil
+	default:
+		return "", "", ErrMalformedRequest
+	}
+}
+
+// formCredentials reads an urlencoded body.
+func formCredentials(r *http.Request, maxBody int64) (string, string, error) {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxBody)
+
+	if err := r.ParseForm(); err != nil {
+		return "", "", ErrMalformedRequest
+	}
+
+	return r.PostFormValue("username"), r.PostFormValue("password"), nil
+}
+
+// multipartCredentials reads a multipart body.
+//
+// ParseForm does not parse one — it reads urlencoded bodies and leaves
+// multipart alone, which is why the multipart support this package
+// documented did not work at all: every field came back empty. Parsing it
+// properly means bounding it twice, once for what reaches memory and once
+// for the whole body, and removing whatever spilled to disk on the way
+// out.
+func multipartCredentials(r *http.Request, maxBody int64) (string, string, error) {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxBody)
+
+	if err := r.ParseMultipartForm(maxBody); err != nil {
+		return "", "", ErrMalformedRequest
+	}
+
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
+
+	return r.PostFormValue("username"), r.PostFormValue("password"), nil
 }

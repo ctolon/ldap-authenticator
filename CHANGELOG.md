@@ -81,6 +81,65 @@ scopes, and faithful bind semantics — including the empty-password
 behaviour, so that a test asserting this library never sends one is
 asserting something.
 
+### Fixed before release
+
+A pre-release audit found eight defects. None of them shipped, but they are
+listed because the reasoning that produced them is worth writing down.
+
+**A username could widen a group filter, and that was an authorisation
+bypass.** Placeholders holding a distinguished name were spliced into
+search filters unescaped, on the reasoning that a DN is structure rather
+than a value and that escaping would corrupt its commas. Both halves were
+wrong: `ldap.EscapeFilter` leaves commas alone, and under a direct bind the
+user's DN is built from the username. A username of `x*` produced
+`(member=uid=x*,ou=people,...)`, which is a prefix match rather than a
+membership test, and it handed the caller every group containing anybody
+whose DN started the same way. Every placeholder in a filter is now
+escaped, with no exceptions.
+
+**LDAP operations could outlive the caller.** go-ldap's operations are
+synchronous and take no context, so a cancelled request kept a goroutine
+and a pool slot until the operation timeout — or, with no operation timeout
+configured, indefinitely. Each operation now runs with the smaller of the
+operation timeout and the caller's remaining deadline, and is raced against
+cancellation; a connection with an abandoned operation on it is closed
+rather than reused.
+
+**Failover only noticed servers that refused a connection.** A directory
+that accepted TCP, completed a TLS handshake, and then could not take a
+bind was never marked down, so every login kept choosing it first. Any
+retriable failure now starts the cooldown. A rejected credential does not,
+because a wrong password says nothing about the server.
+
+**The pool never reached its idle floor.** Warming acquired and released a
+connection `minIdle` times, which opens one connection and hands it round
+in a circle. It now holds them until they are all open, and the reaper puts
+the floor back after closing anything that aged out.
+
+**Closing one client emptied every replica's cache.** `Close` invalidated
+the cache, which for a shared store meant one process's shutdown throwing
+away everybody's entries — and blocking on a round trip to do it. It now
+leaves the cache alone.
+
+**Oversized JSON logins were truncated rather than rejected**, so a valid
+object in the first 64 KiB was accepted with anything at all behind it; a
+body carrying a second object after the credentials was accepted too.
+
+**Multipart logins did not work at all.** `ParseForm` does not parse a
+multipart body; every field came back empty and the login failed as though
+the password were wrong.
+
+**The Gin and Echo adapters ignored two options they documented** —
+`WithSkip` and `WithMaxBodyBytes` — which made "one shared policy, no drift
+between adapters" untrue in the place it was load-bearing.
+
+Two more things changed as a result. `Metrics` is frozen for the 1.x line
+rather than growing methods that only implementations embedding
+`NoopMetrics` would survive; and the release workflow pins its checkout to
+the tag being released, passes that tag through the environment rather than
+into a shell, and tags the contrib modules at the root tag's commit instead
+of at whatever `HEAD` had become.
+
 ### Security
 
 The invariants are listed in `SECURITY.md` and each has a test named after
@@ -91,9 +150,16 @@ indistinguishable to the caller; a pooled connection is never rebound as a
 user; a rejected credential is never retried; and no password reaches a log
 record, an error message, or a cache.
 
-Ten fuzz targets assert those as properties rather than as outputs,
-including two that drive the whole package end to end against a directory
-that parses filters and DNs for real and require that no username, however
-constructed, authenticates as somebody it is not.
+Eleven fuzz targets assert those as properties rather than as outputs,
+including three that drive the whole package end to end against a directory
+that parses filters and DNs for real: no username may authenticate as
+somebody it is not, none may add a term or a wildcard to the user search,
+and none may widen a group filter.
+
+The integration suite runs against a real OpenLDAP over plaintext, LDAPS
+and StartTLS, verifying against a certificate authority this repository
+generates — and asserting that the wrong CA and the wrong hostname are both
+refused, so that the TLS tests cannot pass the way `InsecureSkipVerify`
+would let them.
 
 [Unreleased]: https://github.com/ctolon/ldap-authenticator/commits/main

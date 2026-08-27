@@ -327,3 +327,173 @@ func TestPoolSurvivesAServerRestart(t *testing.T) {
 		}
 	}
 }
+
+// The TLS half of the suite. Plaintext proves the protocol works; these
+// prove the transport does, and they verify against the container's own
+// CA rather than skipping verification — a test that passes against any
+// certificate at all is a test that would pass against an attacker's.
+
+var (
+	ldapsURL = flag.String("ldaps-url", os.Getenv("LDAPAUTH_TEST_TLS_URL"),
+		"URL of the same directory over TLS; the TLS tests skip when empty")
+
+	caFile = flag.String("ldap-ca", os.Getenv("LDAPAUTH_TEST_CA"),
+		"PEM file holding the CA that signed the directory's certificate")
+)
+
+// requireTLS skips unless both a TLS URL and a CA were given.
+func requireTLS(t *testing.T) (url, ca string) {
+	t.Helper()
+
+	if *ldapsURL == "" || *caFile == "" {
+		t.Skip("no -ldaps-url and -ldap-ca; run `make integration`")
+	}
+
+	return *ldapsURL, *caFile
+}
+
+func TestLDAPS(t *testing.T) {
+	url, ca := requireTLS(t)
+
+	auth, err := ldapauth.New(
+		ldapauth.WithURL(url),
+		ldapauth.WithRootCAFile(ca),
+
+		// The container's certificate is issued for its own hostname, not
+		// for the loopback address the test dials.
+		ldapauth.WithServerName("ldap.example.org"),
+		ldapauth.WithDialTimeout(5*time.Second),
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer func() { _ = auth.Close() }()
+
+	p, err := auth.Authenticate(ctx(t), "alice", alicePassword)
+	if err != nil {
+		t.Fatalf("Authenticate over ldaps: %v", err)
+	}
+
+	if !strings.EqualFold(p.GetDN(), aliceDN) {
+		t.Errorf("DN = %q, want %q", p.GetDN(), aliceDN)
+	}
+}
+
+func TestStartTLS(t *testing.T) {
+	_, ca := requireTLS(t)
+
+	// The same plaintext port, upgraded before the bind.
+	auth, err := ldapauth.New(
+		ldapauth.WithURL(requireLDAP(t)),
+		ldapauth.WithStartTLS(),
+		ldapauth.WithRootCAFile(ca),
+		ldapauth.WithServerName("ldap.example.org"),
+		ldapauth.WithDialTimeout(5*time.Second),
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer func() { _ = auth.Close() }()
+
+	if _, err := auth.Authenticate(ctx(t), "alice", alicePassword); err != nil {
+		t.Fatalf("Authenticate over StartTLS: %v", err)
+	}
+}
+
+func TestTheWrongCAIsRefused(t *testing.T) {
+	url, _ := requireTLS(t)
+
+	// A CA that did not sign this certificate. Without this test, the
+	// LDAPS test above would pass just as happily with verification off.
+	other := t.TempDir() + "/other-ca.pem"
+
+	if err := os.WriteFile(other, unrelatedCA, 0o600); err != nil {
+		t.Fatalf("writing the CA: %v", err)
+	}
+
+	auth, err := ldapauth.New(
+		ldapauth.WithURL(url),
+		ldapauth.WithRootCAFile(other),
+		ldapauth.WithServerName("ldap.example.org"),
+		ldapauth.WithDialTimeout(5*time.Second),
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+		ldapauth.WithoutRetry(),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer func() { _ = auth.Close() }()
+
+	if _, err := auth.Authenticate(ctx(t), "alice", alicePassword); err == nil {
+		t.Fatal("the directory was accepted with a CA that did not sign its certificate")
+	}
+}
+
+func TestTheWrongHostnameIsRefused(t *testing.T) {
+	url, ca := requireTLS(t)
+
+	auth, err := ldapauth.New(
+		ldapauth.WithURL(url),
+		ldapauth.WithRootCAFile(ca),
+		ldapauth.WithServerName("not-the-directory.example"),
+		ldapauth.WithDialTimeout(5*time.Second),
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+		ldapauth.WithoutRetry(),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer func() { _ = auth.Close() }()
+
+	if _, err := auth.Authenticate(ctx(t), "alice", alicePassword); err == nil {
+		t.Fatal("the directory was accepted under a hostname its certificate does not carry")
+	}
+}
+
+func TestNoPasswordCrossesThePlaintextPortUnderStartTLS(t *testing.T) {
+	_, ca := requireTLS(t)
+
+	// StartTLS that the server refuses must be a hard failure, not a
+	// downgrade. There is no way to make this server refuse it, so what
+	// is asserted here is the next best thing: that the configuration
+	// refuses to fall back when the CA is wrong, rather than carrying on
+	// in the clear.
+	auth, err := ldapauth.New(
+		ldapauth.WithURL(requireLDAP(t)),
+		ldapauth.WithStartTLS(),
+		ldapauth.WithRootCAFile(ca),
+		ldapauth.WithServerName("not-the-directory.example"),
+		ldapauth.WithDialTimeout(5*time.Second),
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+		ldapauth.WithoutRetry(),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer func() { _ = auth.Close() }()
+
+	if _, err := auth.Authenticate(ctx(t), "alice", alicePassword); err == nil {
+		t.Fatal("a failed StartTLS upgrade let the bind proceed anyway")
+	}
+}
+
+// unrelatedCA is a self-signed certificate that signed nothing here.
+var unrelatedCA = []byte(`-----BEGIN CERTIFICATE-----
+MIIBhTCCASugAwIBAgIQIRi6zePL6mKjOipn+dNuaTAKBggqhkjOPQQDAjASMRAw
+DgYDVQQKEwdBY21lIENvMB4XDTE3MTAyMDE5NDMwNloXDTE4MTAyMDE5NDMwNlow
+EjEQMA4GA1UEChMHQWNtZSBDbzBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABD0d
+7VNhbWvZLWPuj/RtHFjvtJBEwOkhbN/BnnE8rnZR8+sbwnc/KhCk3FhnpHZnQz7B
+5aETbbIgmuvewdjvSBSjYzBhMA4GA1UdDwEB/wQEAwICpDATBgNVHSUEDDAKBggr
+BgEFBQcDATAPBgNVHRMBAf8EBTADAQH/MCkGA1UdEQQiMCCCDmxvY2FsaG9zdDo1
+NDUzgg4xMjcuMC4wLjE6NTQ1MzAKBggqhkjOPQQDAgNIADBFAiEA2zpJEPQyz6/l
+Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc
+6MF9+Yw1Yy0t
+-----END CERTIFICATE-----
+`)

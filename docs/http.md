@@ -62,7 +62,19 @@ username=alice&password=...
 ```
 
 The body is bounded by `httpauth.WithMaxBodyBytes`, 64 KiB by default.
-Credentials are small; a body larger than that is not a login.
+Credentials are small; a body larger than that is not a login, and a body
+over the limit is **rejected** rather than truncated — reading the first 64
+KiB and accepting whatever valid JSON was in it would mean the limit
+bounded memory and nothing else.
+
+A JSON body must also be *only* the credentials. `{"username":"a",
+"password":"b"}{"username":"root"}` is a 400, because a decoder stops at
+the end of the first value and would otherwise never see the second.
+
+All three adapters apply the same limit. So does the Fiber one, which
+cannot see an `*http.Request` — set `fiber.Config.BodyLimit` as well
+there, because by the time the adapter can check the length Fiber has
+already read the body into memory.
 
 ### Why there is no session here
 

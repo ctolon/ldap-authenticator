@@ -83,8 +83,17 @@ so `go test ./...` stays fast and green on a laptop with nothing running.
 
 What it covers is what a fake cannot answer: that a real directory accepts
 the filters and DNs this library builds, that its result codes classify the
-way the retry logic assumes, and that a bind with an empty password behaves
-the way the specification says.
+way the retry logic assumes, that a bind with an empty password behaves the
+way the specification says, and that TLS works — over LDAPS and over
+StartTLS, verified against a real certificate authority.
+
+The certificates come from `internal/tools/testca` rather than from the
+container image, whose own CA expired in January 2026. That matters more
+than it sounds: the alternative was `InsecureSkipVerify`, and a TLS test
+that skips verification passes against any certificate at all, including
+one an attacker presented. Two of the tests exist to prove verification is
+really on — one supplies a CA that signed nothing, the other a hostname the
+certificate does not carry, and both must be refused.
 
 The fixture is in `integration/ldifs/`, and it is deliberately awkward: one
 of the users has a comma in their CN, so that DN escaping is exercised
@@ -98,7 +107,7 @@ the admin account, and every search comes back as "no such object".
 
 ## Fuzzing
 
-Ten targets. The unit-level ones check the escapers and the parsers; the
+Eleven targets. The unit-level ones check the escapers and the parsers; the
 end-to-end ones drive the whole package against `ldaptest` and check the
 property the package exists for.
 
@@ -110,7 +119,8 @@ property the package exists for.
 | `FuzzCheckUsername` | whatever is accepted is safe to splice |
 | `FuzzSearchThenBindAdmitsOnlyTheRealUser` | **no username authenticates as somebody it is not** |
 | `FuzzDirectBindStaysInsideItsSubtree` | no username makes a bind name an entry outside the template's subtree |
-| `FuzzUserSearchFilterStaysOneTerm` | no username adds a term or a wildcard to the filter |
+| `FuzzUserSearchFilterStaysOneTerm` | no username adds a term or a wildcard to the user filter |
+| `FuzzGroupFilterStaysOneTerm` | **no username widens a group filter** — the bypass v1.0 nearly shipped |
 | `FuzzCredentials` | the credential parser never panics and never invents a credential |
 | `FuzzCredentialsRefusesAnEmptyRequest` | an empty request yields no credentials |
 | `FuzzStatusIsAlwaysAValidCode` | the status mapping always returns an HTTP code |

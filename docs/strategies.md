@@ -98,10 +98,13 @@ placeholders available depend on where the template is used:
 | `WithUserSearch` | yes | yes | — |
 | `WithGroupSearch` | yes | yes | yes |
 
-`{{username}}` is escaped for the grammar it lands in. `{{base_dn}}` and
-`{{user_dn}}` are spliced verbatim, because they are DNs rather than values
-— escaping them would turn their commas into literal characters — and
-neither is ever derived from user input.
+Every placeholder is escaped for the grammar it lands in: RFC 4515 in a
+filter, RFC 4514 in a distinguished name. That includes the two that *are*
+DNs. A DN written into a filter is an assertion value like any other, and
+escaping it changes nothing about how it matches — `ldap.EscapeFilter`
+leaves commas, equals signs and spaces alone — while leaving it unescaped
+lets an asterisk in a DN turn a membership test into a prefix match. See
+[security.md](security.md).
 
 A single `%s` with no `{{...}}` anywhere is accepted as shorthand for
 `{{username}}`, so existing configuration can be pasted in unchanged.

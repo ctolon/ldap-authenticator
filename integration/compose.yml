@@ -12,18 +12,45 @@
 # is why it does not define the base entry.
 services:
   openldap:
-    image: osixia/openldap:1.5.0
+    # Pinned by digest, not by tag. A tag is mutable, and a test suite that
+    # can be handed different code without anybody changing a file is a
+    # test suite whose failures nobody can reproduce.
+    image: osixia/openldap:1.5.0@sha256:18742e9c449c9c1afe129d3f2f3ee15fb34cc43e5f940a20f3399728f41d7c28
+    # A fixed hostname, because the image issues its certificate for
+    # whatever the container is called. Left to Docker that is a new
+    # random string every run, and a certificate whose name nobody can
+    # predict is a certificate nobody can verify — which would leave the
+    # TLS tests reaching for InsecureSkipVerify and proving nothing.
+    hostname: ldap.example.org
     command: ["--copy-service", "--loglevel", "warning"]
     environment:
       LDAP_ORGANISATION: Example
       LDAP_DOMAIN: example.com
       LDAP_ADMIN_PASSWORD: admin-password
       LDAP_CONFIG_PASSWORD: config-password
+      # TLS is on, with certificates this repository generates rather
+      # than the ones the image ships — those expired in January 2026, and
+      # the tempting workaround, InsecureSkipVerify, would turn these
+      # tests into tests that pass against any certificate at all.
+      LDAP_TLS: "true"
+      LDAP_TLS_ENFORCE: "false"
+      LDAP_TLS_VERIFY_CLIENT: never
+      LDAP_TLS_CRT_FILENAME: ldap.crt
+      LDAP_TLS_KEY_FILENAME: ldap.key
+      LDAP_TLS_CA_CRT_FILENAME: ca.crt
     volumes:
       - ./ldifs:/container/service/slapd/assets/config/bootstrap/ldif/custom:ro
       - ./config:/config:ro
+      # Mounted file by file rather than over the directory: the image
+      # generates dhparam.pem in there at first start, and a read-only
+      # directory leaves it zero bytes, which is a TLS handshake that ends
+      # in EOF with nothing in the log to say why.
+      - ./testdata/ca.crt:/container/service/slapd/assets/certs/ca.crt:ro
+      - ./testdata/ldap.crt:/container/service/slapd/assets/certs/ldap.crt:ro
+      - ./testdata/ldap.key:/container/service/slapd/assets/certs/ldap.key:ro
     ports:
       - "1389:389"
+      - "1636:636"
     # The probe binds as the admin account rather than anonymously: the
     # image's default ACLs hide the tree from anonymous readers, so an
     # anonymous probe reports "no such object" for a directory that is

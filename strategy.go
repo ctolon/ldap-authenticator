@@ -62,7 +62,7 @@ func (a *Client) directBind(ctx context.Context, username, password string) (*re
 	// deployment that has no service account at all.
 	if a.pool != nil {
 		entry, perr := a.withPooledConn(ctx, func(pooled Conn) (*ldap.Entry, error) {
-			return a.readEntry(pooled, dn)
+			return a.readEntry(ctx, pooled, dn)
 		})
 		if perr != nil {
 			out.close()
@@ -75,7 +75,7 @@ func (a *Client) directBind(ctx context.Context, username, password string) (*re
 		return out, nil
 	}
 
-	entry, err := a.readEntry(conn, dn)
+	entry, err := a.readEntry(ctx, conn, dn)
 	if err != nil {
 		out.close()
 
@@ -102,7 +102,7 @@ func (a *Client) directBind(ctx context.Context, username, password string) (*re
 // user would answer the next request's searches as that user.
 func (a *Client) searchThenBind(ctx context.Context, username, password string) (*resolved, error) {
 	entry, err := a.withPooledConn(ctx, func(pooled Conn) (*ldap.Entry, error) {
-		return a.searchUser(pooled, username)
+		return a.searchUser(ctx, pooled, username)
 	})
 	if err != nil {
 		return nil, err
@@ -118,7 +118,7 @@ func (a *Client) searchThenBind(ctx context.Context, username, password string) 
 
 // searchUser runs the configured user filter and insists on exactly one
 // match.
-func (a *Client) searchUser(conn Conn, username string) (*ldap.Entry, error) {
+func (a *Client) searchUser(ctx context.Context, conn Conn, username string) (*ldap.Entry, error) {
 	filter := a.cfg.userFilter.expandFilter(map[string]string{
 		placeholderUsername: username,
 		placeholderBaseDN:   a.cfg.userBaseDN,
@@ -136,7 +136,7 @@ func (a *Client) searchUser(conn Conn, username string) (*ldap.Entry, error) {
 		nil,
 	)
 
-	result, err := a.search(conn, request)
+	result, err := a.search(ctx, conn, request)
 	if err != nil {
 		return nil, &AuthError{
 			Op:         "user search",
@@ -173,7 +173,7 @@ func (a *Client) searchUser(conn Conn, username string) (*ldap.Entry, error) {
 
 // readEntry fetches one entry by DN, for the direct-bind path where there
 // is nothing to search for.
-func (a *Client) readEntry(conn Conn, dn string) (*ldap.Entry, error) {
+func (a *Client) readEntry(ctx context.Context, conn Conn, dn string) (*ldap.Entry, error) {
 	request := ldap.NewSearchRequest(
 		dn,
 		ScopeBaseObject,
@@ -186,7 +186,7 @@ func (a *Client) readEntry(conn Conn, dn string) (*ldap.Entry, error) {
 		nil,
 	)
 
-	result, err := a.search(conn, request)
+	result, err := a.search(ctx, conn, request)
 	if err != nil {
 		return nil, err
 	}
@@ -221,9 +221,16 @@ func (a *Client) bindAs(ctx context.Context, dn, password string) (Conn, string,
 
 	a.cfg.metrics.ConnOpened(url)
 
-	if err := conn.Bind(dn, password); err != nil {
+	if err := a.operate(ctx, conn, func() error { return conn.Bind(dn, password) }); err != nil {
 		_ = conn.Close()
 		a.cfg.metrics.ConnClosed("error")
+
+		// A bind that failed for a reason worth retrying says something
+		// about the server rather than about the credential, so the
+		// server is the thing to move on from.
+		if retriable(err) {
+			a.servers.penalise(url)
+		}
 
 		code := resultCode(err)
 
@@ -247,12 +254,25 @@ func (a *Client) bindAs(ctx context.Context, dn, password string) (Conn, string,
 // search issues a search, paging it when the configuration asks for
 // paging. Paging matters on Active Directory, which caps a search at 1000
 // entries by default and truncates rather than erroring past it.
-func (a *Client) search(conn Conn, request *ldap.SearchRequest) (*ldap.SearchResult, error) {
-	if a.cfg.pagingSize > 0 {
-		return conn.SearchWithPaging(request, a.cfg.pagingSize)
+func (a *Client) search(ctx context.Context, conn Conn, request *ldap.SearchRequest) (*ldap.SearchResult, error) {
+	var result *ldap.SearchResult
+
+	err := a.operate(ctx, conn, func() error {
+		var serr error
+
+		if a.cfg.pagingSize > 0 {
+			result, serr = conn.SearchWithPaging(request, a.cfg.pagingSize)
+		} else {
+			result, serr = conn.Search(request)
+		}
+
+		return serr
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	return conn.Search(request)
+	return result, nil
 }
 
 // withPooledConn runs fn on a service-account connection and returns it to
@@ -268,6 +288,14 @@ func (a *Client) withPooledConn(ctx context.Context, fn func(Conn) (*ldap.Entry,
 	}
 
 	entry, err := fn(conn)
+
+	// A pooled connection that failed for a retriable reason is a server
+	// that accepted a connection and then could not answer on it. Dialling
+	// it again would succeed and fail again; the point of a URL list is to
+	// move on.
+	if retriable(err) {
+		a.servers.penalise(conn.url)
+	}
 
 	a.pool.release(conn, err)
 

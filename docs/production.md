@@ -76,9 +76,20 @@ which is milliseconds. Sixteen is a lot for most deployments.
 
 ## Failover
 
-`WithURLs` takes an ordered list. A URL that fails to dial is moved behind
-the healthy ones for `WithFailoverCooldown`, so a replica that is down
-costs one connection timeout rather than one per login.
+`WithURLs` takes an ordered list. A URL that fails is moved behind the
+healthy ones for `WithFailoverCooldown`, so a replica that is down costs
+one connection timeout rather than one per login.
+
+**Failing is not only failing to dial.** A server that accepts a TCP
+connection, completes a TLS handshake, and then cannot take a bind or
+answer a search is out of service just as thoroughly as one that refuses
+the connection — and it is the more common shape, because that is what a
+directory looks like while it is shutting down, out of file descriptors, or
+returning `unavailable`. Those failures start the cooldown too.
+
+A rejected credential does not. A wrong password says nothing about the
+server, and penalising on one would let a user with a typo take a healthy
+replica out of rotation.
 
 The cooldown reorders; it never removes. Every URL is still tried before a
 call fails, so a cooldown cannot turn a slow directory into an outage.
@@ -193,6 +204,42 @@ directory.
   failing yet, because a cache that is down falls through to the
   directory, but the directory is now taking the load the cache was there
   to absorb.
+
+## What this library does not do for you
+
+Worth stating plainly, because each of these is a thing an operator has to
+own and none of them has an option here that would suggest otherwise.
+
+**TLS to your users.** This package encrypts the connection to the
+directory. Whatever carries the password from a browser to your process is
+your HTTP server's business, and Basic auth over plaintext HTTP puts it on
+the wire in the clear no matter how carefully this package handles it
+afterwards.
+
+**Rate limiting and brute-force protection.** There is no counter here, and
+no lockout. `WithNegativeCache` keeps a client looping on one stale
+password away from the directory, and `httpauth.WithMinimumDuration` makes
+guessing slower — neither is a rate limiter. Put one in front, and know
+that the directory's own lockout policy is the thing an attacker can weapon
+against your users.
+
+**Authorisation.** `Principal.Groups` is a list of names, or of DNs under
+`WithGroupDNs`. Deciding what a group is allowed to do is yours, and group
+*names* are not unique — two subtrees can each hold a `cn=admins`. If a
+rule matters, write it against a DN.
+
+**Secret rotation.** The service account password is read once, at
+construction. Rotating it means building a new authenticator and closing
+the old one; there is deliberately no way to change it underneath a running
+one, because that would put a lock around every field. The same goes for
+client certificates, unless you set `GetClientCertificate` through
+`WithTLSConfig`.
+
+**Rollback.** A Go module version is immutable once the proxy has seen it.
+Rolling back means pinning the previous version in your own `go.mod`, and
+that is worth having rehearsed before you need it: `go get
+github.com/ctolon/ldap-authenticator@v1.0.0`, rebuild, redeploy. Nothing in
+this package's state outlives a process, so there is no migration to undo.
 
 ## Secrets
 

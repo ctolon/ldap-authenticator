@@ -2,6 +2,7 @@ package ldapauth_test
 
 import (
 	"sort"
+	"strings"
 	"testing"
 
 	ldapauth "github.com/ctolon/ldap-authenticator"
@@ -230,5 +231,132 @@ func TestGroupsAreNotSharedBetweenPrincipals(t *testing.T) {
 
 	if second.GetGroups()[0] == "tampered" {
 		t.Fatal("editing one principal's groups changed the next one's")
+	}
+}
+
+// A username-derived DN reaching a group filter unescaped is an
+// authorisation bypass, and it is the one this package got wrong before
+// v1.0: under a direct bind the DN is built from the username, so a
+// username containing an asterisk produced `(member=uid=x*,ou=people,...)`
+// and turned a membership test into a prefix match.
+func TestAUsernameCannotWidenAGroupFilter(t *testing.T) {
+	t.Parallel()
+
+	const hostileDN = "uid=x*," + peopleDN
+
+	dir := ldaptest.New(
+		// An entry whose RDN value carries filter metacharacters — what
+		// somebody who controls their own account name would have.
+		ldaptest.User(hostileDN, "known-password").
+			With("uid", "x*").
+			With("objectClass", "inetOrgPerson"),
+
+		ldaptest.User(serviceDN, servicePassword).With("objectClass", "person"),
+
+		// A group they are emphatically not in.
+		ldaptest.Group("cn=admins,"+groupsDN).
+			With("cn", "admins").
+			With("objectClass", "groupOfNames").
+			With("member", "uid=xander,"+peopleDN),
+	)
+
+	auth := newAuthenticator(t, dir,
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+		ldapauth.WithGroupSearch(groupsDN, "(&(objectClass=groupOfNames)(member={{user_dn}}))"),
+	)
+
+	identity, err := auth.Authenticate(testContext(t), "x*", "known-password")
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	if groups := identity.GetGroups(); len(groups) != 0 {
+		t.Fatalf("groups = %v, want none: the username widened the group filter", groups)
+	}
+
+	for _, filter := range dir.Filters() {
+		if strings.Contains(filter, "x*") {
+			t.Errorf("filter %q carries an unescaped asterisk from the username", filter)
+		}
+	}
+}
+
+// The other half of the same fix: escaping a DN for a filter must not stop
+// it matching the entry it names. It does not, because ldap.EscapeFilter
+// leaves commas, equals signs and spaces alone.
+func TestAnEscapedDNStillMatchesItsEntry(t *testing.T) {
+	t.Parallel()
+
+	// A DN with a comma, an equals sign and a space in its value — every
+	// character somebody might expect filter escaping to mangle.
+	const awkwardDN = `cn=Doe\, Jane (contractor),` + peopleDN
+
+	dir := ldaptest.New(
+		ldaptest.User(awkwardDN, "jane-password").
+			With("uid", "jane").
+			With("cn", "Doe, Jane (contractor)").
+			With("objectClass", "inetOrgPerson"),
+
+		ldaptest.User(serviceDN, servicePassword).With("objectClass", "person"),
+
+		ldaptest.Group("cn=contractors,"+groupsDN).
+			With("cn", "contractors").
+			With("objectClass", "groupOfNames").
+			With("member", awkwardDN),
+	)
+
+	auth := newAuthenticator(t, dir,
+		ldapauth.WithUserSearch(peopleDN, "(uid={{username}})"),
+		ldapauth.WithServiceAccount(serviceDN, servicePassword),
+		ldapauth.WithGroupSearch(groupsDN, "(&(objectClass=groupOfNames)(member={{user_dn}}))"),
+	)
+
+	identity, err := auth.Authenticate(testContext(t), "jane", "jane-password")
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	if !identity.InGroup("contractors") {
+		t.Fatalf("groups = %v, want contractors: escaping the DN broke the match", identity.GetGroups())
+	}
+}
+
+// Nested resolution re-runs the group filter with each group's DN, so a
+// group whose own name carries metacharacters must not widen it either.
+func TestANestedGroupDNCannotWidenTheFilter(t *testing.T) {
+	t.Parallel()
+
+	dir := ldaptest.New(
+		ldaptest.User(aliceDN, alicePassword).
+			With("uid", "alice").With("objectClass", "inetOrgPerson"),
+
+		ldaptest.User(serviceDN, servicePassword).With("objectClass", "person"),
+
+		ldaptest.Group("cn=team*,"+groupsDN).
+			With("cn", "team*").
+			With("objectClass", "groupOfNames").
+			With("member", aliceDN),
+
+		// Reachable only if the asterisk above survives into the filter.
+		ldaptest.Group("cn=secrets,"+groupsDN).
+			With("cn", "secrets").
+			With("objectClass", "groupOfNames").
+			With("member", "cn=teams-elsewhere,"+groupsDN),
+	)
+
+	auth := newAuthenticator(t, dir,
+		ldapauth.WithUserSearch(peopleDN, "(uid={{username}})"),
+		ldapauth.WithServiceAccount(serviceDN, servicePassword),
+		ldapauth.WithGroupSearch(groupsDN, "(&(objectClass=groupOfNames)(member={{user_dn}}))"),
+		ldapauth.WithNestedGroups(),
+	)
+
+	identity, err := auth.Authenticate(testContext(t), "alice", alicePassword)
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	if identity.InGroup("secrets") {
+		t.Fatalf("groups = %v, want secrets excluded: a group DN widened the filter", identity.GetGroups())
 	}
 }

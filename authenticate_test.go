@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-ldap/ldap/v3"
 
@@ -455,5 +456,77 @@ func TestHealthCheckProbesTheDirectory(t *testing.T) {
 
 	if err := auth.HealthCheck(testContext(t)); err == nil {
 		t.Fatal("HealthCheck succeeded against a directory that is down")
+	}
+}
+
+func TestInvalidationAfterCloseIsErrClosed(t *testing.T) {
+	t.Parallel()
+
+	auth := searchAuth(t, newDirectory(), ldapauth.WithCache(time.Minute))
+
+	if err := auth.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, err := auth.InvalidateUser(testContext(t), "alice"); !errors.Is(err, ldapauth.ErrClosed) {
+		t.Errorf("InvalidateUser: err = %v, want ErrClosed", err)
+	}
+
+	if _, err := auth.InvalidateAll(testContext(t)); !errors.Is(err, ldapauth.ErrClosed) {
+		t.Errorf("InvalidateAll: err = %v, want ErrClosed", err)
+	}
+}
+
+func TestClosingDoesNotEmptyTheCache(t *testing.T) {
+	t.Parallel()
+
+	// A shared cache belongs to whoever owns it. One replica shutting
+	// down must not throw away every other replica's entries — and must
+	// not block on a round trip to do it.
+	store := ldapauth.NewMemoryCache(16, nil)
+	dir := newDirectory()
+
+	first := searchAuth(t, dir, ldapauth.WithCache(time.Minute), ldapauth.WithCacheStore(store))
+
+	if _, err := first.Authenticate(testContext(t), "alice", alicePassword); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	held, err := store.Len(testContext(t))
+	if err != nil {
+		t.Fatalf("Len: %v", err)
+	}
+
+	if held == 0 {
+		t.Fatal("nothing was cached; the test proves nothing")
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	after, err := store.Len(testContext(t))
+	if err != nil {
+		t.Fatalf("Len: %v", err)
+	}
+
+	if after != held {
+		t.Errorf("cache went from %d entries to %d when one client closed", held, after)
+	}
+}
+
+func TestStatsStillAnswersAfterClose(t *testing.T) {
+	t.Parallel()
+
+	auth := searchAuth(t, newDirectory())
+
+	if err := auth.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A metrics scrape landing during shutdown should get a number, not
+	// an error it has nothing to do with.
+	if stats := auth.Stats(testContext(t)); stats.Servers != 1 {
+		t.Errorf("Servers = %d, want 1", stats.Servers)
 	}
 }

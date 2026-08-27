@@ -67,7 +67,7 @@ func newDirectory() *ldaptest.Directory {
 
 // newAuthenticator builds an authenticator against dir, with the given
 // options appended to the ones every test needs. It registers Close.
-func newAuthenticator(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Client {
+func newAuthenticator(t testing.TB, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	base := []ldapauth.Option{
@@ -87,7 +87,7 @@ func newAuthenticator(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Op
 
 // searchAuth is the search-then-bind fixture, which is what most tests
 // want: it exercises the pool, the service bind, and the user search.
-func searchAuth(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Client {
+func searchAuth(t testing.TB, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	base := []ldapauth.Option{
@@ -99,7 +99,7 @@ func searchAuth(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) 
 }
 
 // directAuth is the direct-bind fixture, with no service account at all.
-func directAuth(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Client {
+func directAuth(t testing.TB, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	base := []ldapauth.Option{
@@ -121,7 +121,7 @@ func passwordUser(dn, password string) *ldaptest.Entry {
 }
 
 // testContext is a context that dies with the test.
-func testContext(t *testing.T) context.Context {
+func testContext(t testing.TB) context.Context {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)

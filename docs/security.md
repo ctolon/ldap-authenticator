@@ -80,12 +80,34 @@ a comma adds a component and moves the entry into another subtree.
 [`examples/escaping`](../examples/escaping) prints both, side by side, and
 the DN case is the one that surprises people.
 
-**A DN is not escaped as a value at all.** `{{user_dn}}` and `{{base_dn}}`
-are spliced verbatim, because they are DNs rather than values: escaping
-them would turn their commas into literal characters and the filter would
-match nothing. That is safe because neither is ever caller input —
-`{{base_dn}}` comes from the configuration and `{{user_dn}}` is what the
-directory returned for an entry it had already found.
+**A DN in a filter is escaped like anything else.** It is tempting to
+exempt `{{user_dn}}` and `{{base_dn}}` on the grounds that a DN is
+structure rather than a value, and that escaping would corrupt its commas.
+Both halves of that are wrong, and this package shipped the mistake right
+up to the release candidate for v1.0.
+
+`ldap.EscapeFilter` escapes `(`, `)`, `*`, `\`, NUL, and bytes above 0x7f.
+Commas, equals signs and spaces pass through untouched, so an escaped DN
+still compares equal to the entry it names. What does *not* pass through is
+an asterisk — and under a direct bind, `{{user_dn}}` is built from the
+username:
+
+```
+username:  x*
+bind DN:   uid=x*,ou=people,dc=corp,dc=example      (valid; RFC 4514 does not escape *)
+filter:    (member=uid=x*,ou=people,dc=corp,dc=example)
+```
+
+That is not a membership test any more. It is a prefix match, and it hands
+the caller every group containing anybody whose DN starts `uid=x`. A failed
+login is an inconvenience; this was an authorisation bypass, and it was
+reachable by anybody who could influence their own account name.
+
+Every placeholder in a filter is now escaped for RFC 4515, with no
+exceptions. `TestAUsernameCannotWidenAGroupFilter` is the regression test,
+`TestAnEscapedDNStillMatchesItsEntry` is the one that keeps the fix from
+being "escape everything and break DN matching", and
+`FuzzGroupFilterStaysOneTerm` asserts the property over arbitrary input.
 
 `FuzzEscapeFilterValue` asserts the property directly: whatever the input,
 the output contains no unescaped filter structure. `FuzzUserSearchFilterStaysOneTerm`

@@ -131,6 +131,15 @@ There is no error for this, which is what makes it worth checking: the
 symptom is a cache hit rate near zero and a directory under more load than
 the cache was supposed to leave it.
 
+### A multipart login form does not work
+
+It does now. Before v1.0 this package called `ParseForm` for both
+urlencoded and multipart bodies, and `ParseForm` does not parse multipart —
+every field came back empty and the login failed as though the password
+were wrong.
+
+If you are on an older commit, send urlencoded or JSON instead.
+
 ### It works in tests and fails against the real directory
 
 The usual differences, in order:

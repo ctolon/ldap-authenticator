@@ -83,10 +83,15 @@ type netDialer struct {
 // DialContext implements Dialer.
 //
 // go-ldap's DialURL predates context and takes none, so the dial runs on
-// its own goroutine and the context is honoured by racing it. When the
-// context wins, the goroutine is left to finish and close whatever it
-// opened: abandoning a connection is preferable to leaking a file
-// descriptor, and the net.Dialer's own timeout bounds how long that
+// its own goroutine and the context is honoured by racing it. The StartTLS
+// upgrade runs on that goroutine too: it is another round trip to the same
+// server before anything useful can be sent, and leaving it outside the
+// race would mean a connection that hangs during the handshake ignores the
+// caller's deadline entirely.
+//
+// When the context wins, the goroutine is left to finish and close
+// whatever it opened: abandoning a connection is preferable to leaking a
+// file descriptor, and the net.Dialer's own timeout bounds how long that
 // goroutine can live.
 func (d *netDialer) DialContext(ctx context.Context, addr string) (Conn, error) {
 	if err := ctx.Err(); err != nil {
@@ -119,6 +124,18 @@ func (d *netDialer) DialContext(ctx context.Context, addr string) (Conn, error) 
 			ldap.DialWithTLSConfig(d.tlsConfig),
 		)
 
+		// The upgrade happens here rather than after the race, because a
+		// StartTLS that hangs is a dial that hangs: it is a round trip to
+		// the same server, over the same connection, before anything
+		// useful can be sent.
+		if err == nil && d.startTLS && needsStartTLS(addr) {
+			if terr := conn.StartTLS(d.tlsConfig); terr != nil {
+				_ = conn.Close()
+
+				conn, err = nil, fmt.Errorf("ldapauth: starttls %s: %w", addr, terr)
+			}
+		}
+
 		results <- dialResult{conn: conn, err: err}
 	}()
 
@@ -138,14 +155,6 @@ func (d *netDialer) DialContext(ctx context.Context, addr string) (Conn, error) 
 		}
 
 		conn := r.conn
-
-		if d.startTLS && needsStartTLS(addr) {
-			if err := conn.StartTLS(d.tlsConfig); err != nil {
-				_ = conn.Close()
-
-				return nil, fmt.Errorf("ldapauth: starttls %s: %w", addr, err)
-			}
-		}
 
 		if d.opTimeout > 0 {
 			conn.SetTimeout(d.opTimeout)

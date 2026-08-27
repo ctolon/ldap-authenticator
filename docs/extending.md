@@ -182,9 +182,15 @@ func (m *promMetrics) AuthAttempt(result string, d time.Duration) {
 }
 ```
 
-Embedding `NoopMetrics` is not optional advice. `Metrics` will grow methods
-in 1.x releases as the package finds things worth counting, and an embedded
-`NoopMetrics` is what keeps that from breaking your build.
+`Metrics` is frozen for the 1.x line. No method will be added to it —
+adding one would break every implementation that did not happen to embed
+`NoopMetrics`, and "embed this and hope" is a request rather than a
+compatibility promise. Anything worth counting later arrives as a separate
+optional interface, discovered by type assertion, which an implementation
+may satisfy or ignore.
+
+Embedding `NoopMetrics` is still worth doing: it saves writing the methods
+you do not care about.
 
 Every method is called on the goroutine doing the work, so an
 implementation that blocks blocks an authentication. Do the cheap thing and

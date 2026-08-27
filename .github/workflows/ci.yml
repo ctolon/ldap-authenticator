@@ -283,6 +283,7 @@ jobs:
       - bench
       - examples
       - integration
+      - dependency-review
     if: always()
     steps:
       - name: fail if anything above failed

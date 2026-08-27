@@ -159,6 +159,32 @@ func (s *serverSet) order() []int {
 	return append(healthy, cooling...)
 }
 
+// penalise marks a URL down after a failure that happened *after* the
+// connection was established.
+//
+// Dialling is not the only way a server fails. One that accepts a TCP
+// connection, completes a TLS handshake, and then cannot answer a bind or
+// a search is a server this package would otherwise keep choosing first,
+// for as long as the cooldown never started — which is the failure mode
+// where a URL list stops being failover and becomes decoration.
+//
+// Only failures worth retrying reach here. A rejected credential says
+// nothing about the server, and penalising on one would let a user with a
+// wrong password take a healthy replica out of rotation.
+func (s *serverSet) penalise(url string) {
+	if url == "" {
+		return
+	}
+
+	for i, candidate := range s.urls {
+		if candidate == url {
+			s.markDown(i)
+
+			return
+		}
+	}
+}
+
 func (s *serverSet) markDown(i int) {
 	if s.cooldown <= 0 {
 		return

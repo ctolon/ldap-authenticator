@@ -97,7 +97,9 @@ that if your API has a shape of its own.
 
 Every option is an `httpauth.Option`, shared with the other adapters:
 `WithRealm`, `RequireAnyGroup`, `RequireAllGroups`, `WithMinimumDuration`,
-`WithErrorHandler`, `WithSkip`, `WithMaxBodyBytes`.
+`WithErrorHandler`, `WithSkip`, `WithMaxBodyBytes`. All of them are applied
+here, including the two — the skip predicate and the body limit — that this
+adapter quietly ignored before v1.0.
 
 An option that does not validate panics, because middleware is wired at
 startup and there is nowhere to return an error to. Use

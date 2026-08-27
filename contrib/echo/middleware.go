@@ -31,6 +31,10 @@ func BasicAuth(auth ldapauth.Authenticator, opts ...httpauth.Option) echo.Middle
 		return func(c echo.Context) error {
 			request := c.Request()
 
+			if policy.ShouldSkip(request) {
+				return next(c)
+			}
+
 			username, password, ok := request.BasicAuth()
 			if !ok {
 				policy.Reject(c.Response(), request, httpauth.ErrNoCredentials)
@@ -76,7 +80,7 @@ func LoginHandler(
 	return func(c echo.Context) error {
 		request := c.Request()
 
-		username, password, err := httpauth.Credentials(request, httpauth.DefaultMaxBodyBytes)
+		username, password, err := httpauth.Credentials(request, policy.MaxBodyBytes())
 		if err != nil {
 			policy.Reject(c.Response(), request, err)
 

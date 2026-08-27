@@ -107,9 +107,10 @@
 //     password an unauthenticated bind, which a conforming server answers
 //     with success. go-ldap refuses to send one as well; this package
 //     refuses sooner, and with an error the caller can branch on.
-//   - Every value spliced into a filter is escaped for RFC 4515, and every
-//     value spliced into a DN for RFC 4514. There is no API through which
-//     an unescaped value can be interpolated.
+//   - Every value spliced into a filter is escaped for RFC 4515 — the ones
+//     that are themselves distinguished names included — and every value
+//     spliced into a DN is escaped for RFC 4514. There is no API through
+//     which an unescaped value can be interpolated.
 //   - A wrong password and an unknown user return the same error, so a
 //     login form built on this package cannot become an account
 //     enumeration oracle by forgetting to collapse them.

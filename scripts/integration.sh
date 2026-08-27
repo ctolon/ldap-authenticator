@@ -23,6 +23,12 @@ command -v docker >/dev/null || die "docker is not installed"
 
 COMPOSE=(docker compose -f integration/compose.yml)
 URL="ldap://127.0.0.1:1389"
+TLS_URL="ldaps://127.0.0.1:1636"
+TLS_HOST="ldap.example.org"
+# Absolute, because `go test` runs the binary with the package directory
+# as its working directory and a relative path would resolve somewhere
+# else entirely.
+CA_FILE="$PWD/integration/testdata/ca.crt"
 
 DOWN=0
 ARGS=()
@@ -41,6 +47,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ---- certificates
+#
+# Generated before the container starts, because it reads them at boot.
+# The image ships its own CA and that CA expired in January 2026; see
+# internal/tools/testca for why the workaround is not InsecureSkipVerify.
+
+echo "==> generating certificates"
+go run ./internal/tools/testca -dir integration/testdata -host "$TLS_HOST"
+
 # ---- bring the directory up
 
 echo "==> starting the directory"
@@ -57,5 +72,9 @@ echo "==> applying ACLs"
 
 # ---- run the suite
 
-echo "==> running the integration suite against $URL"
-go test -count=1 -race ./integration/ -ldap-url "$URL" "${ARGS[@]}"
+echo "==> running the integration suite against $URL and $TLS_URL"
+go test -count=1 -race ./integration/ \
+	-ldap-url "$URL" \
+	-ldaps-url "$TLS_URL" \
+	-ldap-ca "$CA_FILE" \
+	"${ARGS[@]}"

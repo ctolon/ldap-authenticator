@@ -200,3 +200,27 @@ func TestLoginHandlerAcceptsAForm(t *testing.T) {
 		t.Fatalf("status = %d body = %q, want a successful form login", status, body)
 	}
 }
+
+func TestTheBodyLimitIsHonoured(t *testing.T) {
+	t.Parallel()
+
+	// Fiber cannot apply WithSkip — there is no *http.Request — but the
+	// body limit is a number, and a number it can apply.
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Post("/login", ldapauthfiber.LoginHandler(newAuth(t),
+		func(*fiber.Ctx, ldapauth.Identity) error {
+			t.Error("the success handler ran for an oversized body")
+
+			return nil
+		},
+		httpauth.WithMaxBodyBytes(16),
+	))
+
+	body := `{"username":"alice","password":"alice-pw"}`
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	if status, _, _ := do(t, app, req); status == http.StatusOK {
+		t.Fatal("an oversized body was accepted")
+	}
+}

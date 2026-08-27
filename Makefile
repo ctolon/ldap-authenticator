@@ -2,6 +2,12 @@
 
 GO ?= go
 FUZZTIME ?= 30s
+
+# Fuzzing workers. Capped rather than left to the core count; see
+# scripts/fuzz.sh for the failure that uncapping produces. Empty means
+# "let the script decide", which is eight or the core count, whichever is
+# smaller.
+FUZZWORKERS ?=
 BENCHTIME ?= 200ms
 
 # The contrib modules are separate so that the root module can keep its
@@ -106,7 +112,7 @@ bench-compile:
 ## fuzz-smoke: run each fuzz target briefly, as CI does on every push
 .PHONY: fuzz-smoke
 fuzz-smoke:
-	@./scripts/fuzz.sh $(FUZZTIME)
+	@FUZZWORKERS="$(FUZZWORKERS)" ./scripts/fuzz.sh $(FUZZTIME)
 
 ## fmt: format the tree
 .PHONY: fmt
