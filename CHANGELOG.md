@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-27
+
 The first release. An LDAP authenticator whose only direct dependency is
 `github.com/go-ldap/ldap/v3`, with the framework integrations kept in
 separate modules so that importing it never puts a web framework in your
@@ -162,4 +164,5 @@ generates — and asserting that the wrong CA and the wrong hostname are both
 refused, so that the TLS tests cannot pass the way `InsecureSkipVerify`
 would let them.
 
-[Unreleased]: https://github.com/ctolon/ldap-authenticator/commits/main
+[Unreleased]: https://github.com/ctolon/ldap-authenticator/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/ctolon/ldap-authenticator/releases/tag/v1.0.0
