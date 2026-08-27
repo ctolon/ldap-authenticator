@@ -188,3 +188,46 @@ func TestPrincipalReachesBothContexts(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 }
+
+func TestSkipIsHonoured(t *testing.T) {
+	t.Parallel()
+
+	// "One shared policy, so behaviour cannot drift between the adapters"
+	// was not true: the skip predicate and the body limit were the
+	// net/http middleware's alone.
+	e := echo.New()
+	e.HideBanner = true
+	e.Use(ldapauthecho.BasicAuth(newAuth(t),
+		httpauth.WithSkip(func(req *http.Request) bool { return req.URL.Path == "/healthz" }),
+	))
+	e.GET("/healthz", func(c echo.Context) error { return c.String(http.StatusOK, "ok") })
+
+	rec := do(t, e, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Fatalf("status = %d body = %q, want the request to pass through", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTheBodyLimitIsHonoured(t *testing.T) {
+	t.Parallel()
+
+	e := echo.New()
+	e.HideBanner = true
+	e.POST("/login", ldapauthecho.LoginHandler(newAuth(t),
+		func(echo.Context, ldapauth.Identity) error {
+			t.Error("the success handler ran for an oversized body")
+
+			return nil
+		},
+		httpauth.WithMaxBodyBytes(16),
+	))
+
+	body := `{"username":"alice","password":"alice-pw"}`
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	if rec := do(t, e, req); rec.Code == http.StatusOK {
+		t.Fatal("an oversized body was accepted")
+	}
+}

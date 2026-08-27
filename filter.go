@@ -19,13 +19,15 @@ import (
 // The recognised placeholders are:
 //
 //	{{username}}    the username as supplied by the caller
-//	{{base_dn}}     the configured user base DN, spliced verbatim
+//	{{base_dn}}     the configured base DN for the search
 //	{{user_dn}}     the authenticated user's DN (group templates only)
 //
-// {{base_dn}} and {{user_dn}} are not escaped as values because they are
-// not values: they are DNs the deployment configured or the directory
-// returned, and escaping them would corrupt their commas. Neither is ever
-// derived from user input.
+// All three are escaped, for whichever grammar they are being spliced
+// into. It is tempting to exempt the two that are distinguished names, on
+// the grounds that a DN is structure rather than a value — and that is a
+// mistake. A DN written into a search filter is an assertion value like
+// any other, and under a direct bind {{user_dn}} is built from the
+// username, so exempting it would put caller input into a filter unescaped.
 const (
 	placeholderUsername = "username"
 	placeholderBaseDN   = "base_dn"
@@ -153,25 +155,35 @@ func (t template) isZero() bool { return t.raw == "" }
 
 func (t template) String() string { return t.raw }
 
-// verbatim is the escape function for values that are already DNs and must
-// not be escaped as attribute values.
+// verbatim substitutes a value unchanged.
+//
+// Nothing in the package uses it any more, and that is the point: the one
+// place that did — splicing a DN into a search filter — is what shipped an
+// authorisation bypass. It is kept because the template tests need a way
+// to check expansion separately from escaping, and it is unexported so
+// that no caller can reach for it.
 func verbatim(s string) string { return s }
 
-// expandFilter renders a search-filter template, escaping each placeholder
-// for what it is: a username is a value and is escaped for RFC 4515, while
-// a DN is a DN and is spliced verbatim — escaping it would turn its commas
-// into literal characters and the filter would match nothing.
+// expandFilter renders a search-filter template, escaping every value it
+// splices in for RFC 4515.
 //
-// The distinction is safe because the DN placeholders are never caller
-// input. {{base_dn}} comes from the configuration, and {{user_dn}} is what
-// the directory itself returned for an entry it had already found.
+// Every value, including the ones that are distinguished names. A DN used
+// as an assertion value is an assertion value, and RFC 4515 says an
+// assertion value is escaped — the fact that it is also a DN changes
+// nothing about the grammar it is being written into.
+//
+// This is safe as well as correct, which is worth being explicit about
+// because the temptation is to think otherwise: ldap.EscapeFilter escapes
+// only `(`, `)`, `*`, `\`, NUL, and bytes above 0x7f. A DN's commas,
+// equals signs, and spaces pass through untouched, so an escaped DN still
+// compares equal to the entry it names. What does not pass through is the
+// asterisk in a DN like `uid=x*,ou=people,dc=corp,dc=example` — which,
+// spliced raw into `(member={{user_dn}})`, turns a membership test into a
+// prefix match and hands the caller every group whose member happens to
+// start the same way.
 func (t template) expandFilter(vars map[string]string) string {
-	return t.expandWith(func(name, value string) string {
-		if name == placeholderUsername {
-			return escapeFilterValue(value)
-		}
-
-		return value
+	return t.expandWith(func(_, value string) string {
+		return escapeFilterValue(value)
 	}, vars)
 }
 

@@ -28,6 +28,12 @@ func BasicAuth(auth ldapauth.Authenticator, opts ...httpauth.Option) gin.Handler
 	}
 
 	return func(c *gin.Context) {
+		if policy.ShouldSkip(c.Request) {
+			c.Next()
+
+			return
+		}
+
 		username, password, ok := c.Request.BasicAuth()
 		if !ok {
 			reject(c, policy, httpauth.ErrNoCredentials)
@@ -73,7 +79,7 @@ func LoginHandler(
 	}
 
 	return func(c *gin.Context) {
-		username, password, err := httpauth.Credentials(c.Request, httpauth.DefaultMaxBodyBytes)
+		username, password, err := httpauth.Credentials(c.Request, policy.MaxBodyBytes())
 		if err != nil {
 			reject(c, policy, err)
 

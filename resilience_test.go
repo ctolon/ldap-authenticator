@@ -818,3 +818,244 @@ func TestRetryGivesUpOnTheElapsedBudget(t *testing.T) {
 		t.Errorf("dial attempts = %d, want the elapsed budget to have stopped it much sooner", got)
 	}
 }
+
+func TestPoolMinIdleIsActuallyReached(t *testing.T) {
+	t.Parallel()
+
+	// Acquire-then-release in a loop opens one connection and hands it
+	// round in a circle, which is what this used to do: the floor was
+	// configured, reported, and never reached.
+	dir := newDirectory()
+
+	auth := searchAuth(t, dir,
+		ldapauth.WithPoolMinIdle(3),
+		ldapauth.WithPoolSize(8),
+		ldapauth.WithPoolHealthCheck(false),
+	)
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for auth.Stats(testContext(t)).PoolIdle < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("PoolIdle = %d, want 3", auth.Stats(testContext(t)).PoolIdle)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestTheFloorIsRestoredAfterReaping(t *testing.T) {
+	t.Parallel()
+
+	clock := newClock()
+	dir := newDirectory()
+
+	auth := searchAuth(t, dir,
+		ldapauth.WithClock(clock.Now),
+		ldapauth.WithPoolMinIdle(2),
+		ldapauth.WithPoolMaxIdleTime(4*time.Second),
+		ldapauth.WithPoolHealthCheck(false),
+	)
+
+	waitForIdle := func(want int) {
+		t.Helper()
+
+		deadline := time.Now().Add(10 * time.Second)
+
+		for auth.Stats(testContext(t)).PoolIdle != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("PoolIdle = %d, want %d", auth.Stats(testContext(t)).PoolIdle, want)
+			}
+
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	waitForIdle(2)
+
+	opened, _ := dir.Conns()
+
+	// Age them all out. The reaper closes them, and then has to put the
+	// floor back — otherwise one quiet night leaves the morning's first
+	// burst paying for every connection it needs.
+	clock.Advance(time.Minute)
+
+	// Waiting on the idle count would race: it is still 2 until the
+	// reaper runs. The connection count is what says replacements
+	// happened.
+	deadline := time.Now().Add(15 * time.Second)
+
+	for {
+		reopened, _ := dir.Conns()
+		if reopened > opened {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("the reaper closed the idle connections and never replaced them")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	waitForIdle(2)
+}
+
+func TestAServerThatAcceptsButCannotAnswerIsTakenOutOfRotation(t *testing.T) {
+	t.Parallel()
+
+	// TCP and TLS succeed; the bind does not. Without penalising the
+	// server after the dial, the cooldown never starts and every login
+	// keeps choosing the broken replica first.
+	dir := newDirectory()
+
+	dir.BindHook = func(dn, _ string) error {
+		if dn == serviceDN {
+			return ldap.NewError(ldap.LDAPResultUnavailable, errors.New("shutting down"))
+		}
+
+		return nil
+	}
+
+	auth := newAuthenticator(t, dir,
+		ldapauth.WithURL(secondURL),
+		ldapauth.WithUserSearch(peopleDN, "(uid={{username}})"),
+		ldapauth.WithServiceAccount(serviceDN, servicePassword),
+		ldapauth.WithFailoverCooldown(time.Minute),
+		ldapauth.WithoutRetry(),
+	)
+
+	// The service bind fails on whichever server it reached.
+	_, _ = auth.Authenticate(testContext(t), "alice", alicePassword)
+
+	if healthy := auth.Stats(testContext(t)).HealthyServers; healthy != 1 {
+		t.Errorf("HealthyServers = %d, want 1: the server that could not answer is still preferred", healthy)
+	}
+}
+
+func TestARejectedCredentialDoesNotTakeAServerOutOfRotation(t *testing.T) {
+	t.Parallel()
+
+	// The other half: a wrong password says nothing about the server, and
+	// penalising on one would let any user with a typo evict a healthy
+	// replica.
+	dir := newDirectory()
+
+	auth := newAuthenticator(t, dir,
+		ldapauth.WithURL(secondURL),
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+		ldapauth.WithFailoverCooldown(time.Minute),
+	)
+
+	for range 5 {
+		_, _ = auth.Authenticate(testContext(t), "alice", "wrong")
+	}
+
+	if healthy := auth.Stats(testContext(t)).HealthyServers; healthy != 2 {
+		t.Errorf("HealthyServers = %d, want 2", healthy)
+	}
+}
+
+func TestACancelledRequestDoesNotHoldAConnection(t *testing.T) {
+	t.Parallel()
+
+	// go-ldap's operations block until the server answers. A caller who
+	// has gone away must not keep a pool slot until the operation timeout
+	// — under load that is how a pool empties.
+	dir := newDirectory()
+
+	blocked := make(chan struct{})
+	arrived := make(chan struct{}, 1)
+
+	dir.SearchHook = func(*ldap.SearchRequest) error {
+		select {
+		case arrived <- struct{}{}:
+		default:
+		}
+
+		<-blocked
+
+		return nil
+	}
+
+	auth := searchAuth(t, dir,
+		ldapauth.WithPoolSize(1),
+		ldapauth.WithPoolHealthCheck(false),
+		ldapauth.WithoutRetry(),
+		ldapauth.WithOperationTimeout(0),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	failed := make(chan error, 1)
+
+	go func() {
+		_, err := auth.Authenticate(ctx, "alice", alicePassword)
+		failed <- err
+	}()
+
+	<-arrived
+	cancel()
+
+	select {
+	case err := <-failed:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a cancelled request was still waiting on the directory")
+	}
+
+	// And the slot came back, so the next caller is not queued behind a
+	// request nobody is waiting for.
+	deadline := time.Now().Add(5 * time.Second)
+
+	for auth.Stats(context.Background()).PoolInUse != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the pool slot was never released")
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	close(blocked)
+}
+
+func TestAnOperationCannotOutliveTheRequestDeadline(t *testing.T) {
+	t.Parallel()
+
+	// With no operation timeout configured, the caller's deadline is the
+	// only bound there is — and it has to actually bound something.
+	dir := newDirectory()
+
+	blocked := make(chan struct{})
+	defer close(blocked)
+
+	dir.SearchHook = func(*ldap.SearchRequest) error {
+		<-blocked
+
+		return nil
+	}
+
+	auth := searchAuth(t, dir,
+		ldapauth.WithOperationTimeout(0),
+		ldapauth.WithRequestTimeout(0),
+		ldapauth.WithPoolHealthCheck(false),
+		ldapauth.WithoutRetry(),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+
+	_, err := auth.Authenticate(ctx, "alice", alicePassword)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Errorf("the operation ran for %s past a 100ms deadline", elapsed)
+	}
+}

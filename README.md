@@ -223,11 +223,12 @@ answer.
   HMAC under a random key, and a `Cache` implementation never sees a
   credential.
 
-Each of these has a test named after what it protects. Ten fuzz targets
-assert the properties rather than the outputs — including two that drive
+Each of these has a test named after what it protects. Eleven fuzz targets
+assert the properties rather than the outputs — including three that drive
 the whole package end to end against a directory that parses filters and
-DNs for real, and require that no username, however constructed,
-authenticates as somebody it is not.
+DNs for real: no username may authenticate as somebody it is not, none may
+add a term or a wildcard to the user search, and none may widen a group
+filter.
 
 ## Several replicas
 
@@ -400,8 +401,10 @@ newest; the root module and the Gin and Echo adapters compile for sixteen
 GOOS/GOARCH pairs, and the Fiber one for fourteen — fasthttp has no wasm
 listener; the root module still has exactly one direct dependency; every
 exported declaration has a doc comment and every documentation link
-resolves; coverage is above its floor; all ten fuzz targets run; the
-workflows lint; and the integration suite passes against a real OpenLDAP.
+resolves; coverage is above its floor; all eleven fuzz targets run; the
+workflows lint; and the integration suite passes against a real OpenLDAP
+over plaintext, LDAPS and StartTLS, verifying against a real certificate
+authority.
 
 Every action is pinned by commit SHA, every job has a timeout and the
 least privilege it can do its work with, and no checkout leaves a

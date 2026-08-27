@@ -55,6 +55,13 @@ if [ "${1:-}" = "--contrib" ]; then
 		die "v$version is not tagged; release the root module first"
 	fi
 
+	# The commit the root tag names, not HEAD. Between cutting the root
+	# release and pushing the contrib tags there is a wait for the module
+	# proxy, and a repository does not stop moving during it — contrib
+	# modules tagged at HEAD would be built from code the root release
+	# never contained.
+	root_commit=$(git rev-list -n1 "v$version")
+
 	for module in "${CONTRIB[@]}"; do
 		required=$(required_root_version "$module")
 
@@ -68,8 +75,8 @@ if [ "${1:-}" = "--contrib" ]; then
 			die "$tag already exists"
 		fi
 
-		git tag -a "$tag" -m "$module v$version"
-		echo "tagged $tag"
+		git tag -a "$tag" -m "$module v$version" "$root_commit"
+		echo "tagged $tag at ${root_commit:0:12}"
 	done
 
 	echo

@@ -116,7 +116,8 @@ A template that is parsed at construction gets three things a format string
 does not: the placeholder names are validated at startup, so a typo is a
 startup failure rather than a failed login; each placeholder is escaped for
 the grammar it lands in, so a username is escaped as a filter value and a
-DN is spliced verbatim; and there is no exported path that interpolates
+DN in a filter is escaped for the filter, not for the DN grammar it also
+happens to belong to; and there is no exported path that interpolates
 without escaping.
 
 A single `%s` is still accepted, because most LDAP configuration in the

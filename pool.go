@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,14 +28,24 @@ type pool struct {
 	// caller's context. It starts full.
 	tokens chan struct{}
 
+	// warming serialises the top-up. Two of them at once would not break
+	// anything — the token semaphore still bounds the size — but they
+	// would each open connections the other was about to, and the pool
+	// would sit above its floor for no reason.
+	warming atomic.Bool
+
 	mu     sync.Mutex
 	idle   []*pooledConn
 	inUse  int
 	closed bool
 
-	// janitorDone is closed when the background reaper has stopped.
+	// janitorStop and janitorDone bracket the background reaper.
 	janitorStop chan struct{}
 	janitorDone chan struct{}
+
+	// life is the authenticator's own context, not any caller's. The
+	// reaper's top-up runs under it so that shutting down stops it.
+	life context.Context
 }
 
 // pooledConn is a connection with the bookkeeping the pool needs to decide
@@ -49,7 +60,7 @@ type pooledConn struct {
 	idleSince time.Time
 }
 
-func newPool(cfg *config, dialer Dialer, servers *serverSet) *pool {
+func newPool(life context.Context, cfg *config, dialer Dialer, servers *serverSet) *pool {
 	p := &pool{
 		cfg:         cfg,
 		dialer:      dialer,
@@ -57,6 +68,7 @@ func newPool(cfg *config, dialer Dialer, servers *serverSet) *pool {
 		tokens:      make(chan struct{}, cfg.poolSize),
 		janitorStop: make(chan struct{}),
 		janitorDone: make(chan struct{}),
+		life:        life,
 	}
 
 	for range cfg.poolSize {
@@ -76,6 +88,14 @@ func newPool(cfg *config, dialer Dialer, servers *serverSet) *pool {
 // slots on failure would shrink to nothing during the outage it is meant
 // to survive.
 func (p *pool) acquire(ctx context.Context) (*pooledConn, error) {
+	// Checked before the select rather than only inside it. A select with
+	// two ready cases picks at random, so a caller who has already given
+	// up would get a connection half the time — and the failure that
+	// follows would be a different one on every run.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrPoolExhausted, err)
+	}
+
 	select {
 	case <-p.tokens:
 	case <-ctx.Done():
@@ -149,6 +169,15 @@ func (p *pool) open(ctx context.Context) (*pooledConn, error) {
 		if err := conn.Bind(p.cfg.serviceDN, p.cfg.servicePassword); err != nil {
 			_ = conn.Close()
 			p.cfg.metrics.ConnClosed("error")
+
+			// A server that accepted the connection and then could not
+			// take the service bind is a server to move on from. Not for
+			// a rejected credential, though: that is the same wrong
+			// password on every replica, and penalising would empty the
+			// rotation over a configuration mistake.
+			if retriable(err) {
+				p.servers.penalise(url)
+			}
 
 			return nil, &AuthError{
 				Op:         "service bind",
@@ -250,17 +279,54 @@ func (p *pool) discard(conn *pooledConn, reason string) {
 	p.cfg.metrics.ConnClosed(reason)
 }
 
-// warm opens up to minIdle connections. It runs in the background from
-// New, because a directory that is not up yet is a reason to fail the
-// first login, not a reason to fail the process.
+// warm opens connections until the pool holds minIdle idle ones.
+//
+// The subtlety, and the reason this is not a loop of acquire-then-release:
+// releasing a connection puts it back where the next acquire will find it,
+// so acquiring and releasing minIdle times opens exactly one connection
+// and hands it round in a circle. Every connection has to be held until
+// they are all open.
+//
+// It runs in the background from New, and again after the reaper closes an
+// idle connection — a floor that is only established once is a floor that
+// erodes over the first quiet hour. Failures are the pool's own business:
+// a directory that is not up yet is a reason for the first login to fail,
+// not for the process to.
 func (p *pool) warm(ctx context.Context) {
-	for range p.cfg.poolMinIdle {
+	if p.cfg.poolMinIdle <= 0 {
+		return
+	}
+
+	if !p.warming.CompareAndSwap(false, true) {
+		return
+	}
+
+	defer p.warming.Store(false)
+
+	p.mu.Lock()
+	held := len(p.idle)
+	closed := p.closed
+	p.mu.Unlock()
+
+	if closed || held >= p.cfg.poolMinIdle {
+		return
+	}
+
+	opened := make([]*pooledConn, 0, p.cfg.poolMinIdle-held)
+
+	defer func() {
+		for _, conn := range opened {
+			p.release(conn, nil)
+		}
+	}()
+
+	for range p.cfg.poolMinIdle - held {
 		conn, err := p.acquire(ctx)
 		if err != nil {
 			return
 		}
 
-		p.release(conn, nil)
+		opened = append(opened, conn)
 	}
 }
 
@@ -283,7 +349,12 @@ func (p *pool) janitor() {
 		case <-p.janitorStop:
 			return
 		case <-ticker.C:
-			p.reap()
+			if p.reap() > 0 {
+				// The floor has to be re-established, or a quiet night
+				// leaves the morning's first burst paying for every
+				// connection it needs.
+				p.warm(p.life)
+			}
 		}
 	}
 }
@@ -302,13 +373,14 @@ func (p *pool) reapInterval() time.Duration {
 	return min(max(budget/4, time.Second), time.Minute)
 }
 
-func (p *pool) reap() {
+// reap closes idle connections that have aged out and reports how many.
+func (p *pool) reap() int {
 	p.mu.Lock()
 
 	if p.closed {
 		p.mu.Unlock()
 
-		return
+		return 0
 	}
 
 	keep := p.idle[:0]
@@ -335,6 +407,8 @@ func (p *pool) reap() {
 	for _, conn := range expired {
 		p.discard(conn, "idle")
 	}
+
+	return len(expired)
 }
 
 // close shuts the pool down. Connections that are out on loan are not

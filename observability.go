@@ -31,7 +31,6 @@ const (
 	CacheHit         = "hit"
 	CacheMiss        = "miss"
 	CacheNegativeHit = "negative_hit"
-	CacheEvicted     = "evicted"
 
 	// CacheCoalesced is a request that waited on an identical
 	// authentication already in flight instead of opening one of its own.
@@ -53,10 +52,17 @@ const (
 // implementation that blocks blocks an authentication. Do the cheap thing
 // here and buffer if you must.
 //
-// Embed NoopMetrics in your implementation. Methods will be added to this
-// interface in future minor versions as the package grows things worth
-// counting, and an embedded NoopMetrics is what keeps that from breaking
-// your build.
+// # Stability
+//
+// This interface is frozen for the 1.x line. No method will be added to
+// it, because adding one would break every implementation that does not
+// embed NoopMetrics — and "embed this and hope" is not a compatibility
+// promise, it is a request. Anything worth counting later arrives as a
+// separate optional interface that an implementation may also satisfy,
+// discovered by type assertion.
+//
+// Embedding NoopMetrics is still worth doing: it saves writing the methods
+// you do not care about.
 type Metrics interface {
 	// AuthAttempt reports one completed call to Authenticate, with one of
 	// the Result constants and how long it took.

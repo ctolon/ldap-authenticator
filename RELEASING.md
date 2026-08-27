@@ -56,6 +56,24 @@ Before running the script:
       tagged.
 - [ ] `go doc -all` reads as a manual for anything you changed.
 
+And the parts no gate in this repository can check, because the
+infrastructure is not here:
+
+- [ ] **Active Directory.** The AD paths — UPN and down-level direct bind,
+      `objectCategory` filters, the `LDAP_MATCHING_RULE_IN_CHAIN` group
+      search, paging past 1000 entries, and a disabled or locked account —
+      are covered against the in-memory directory and against OpenLDAP.
+      Neither is Active Directory. Run them against a test domain
+      controller before a release that touched any of it.
+- [ ] **Load.** A soak against a directory with realistic latency, watching
+      pool occupancy, what a primary going away does, and whether a
+      graceful shutdown drains. The weekly Security workflow repeats the
+      suites twenty-five times under the race detector, which finds
+      different things than load does.
+- [ ] **Rollback.** Pinning the previous version and redeploying, rehearsed
+      rather than assumed. A Go module version is immutable once the proxy
+      has seen it, so this is the only rollback there is.
+
 ## Cutting a release
 
 ```sh

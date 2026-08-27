@@ -39,8 +39,13 @@ jobs:
       module: ${{ steps.parse.outputs.module }}
       prerelease: ${{ steps.parse.outputs.prerelease }}
     steps:
+      # Pinned to the tag rather than left to the default. On a tag push
+      # the default happens to be the tag; on a workflow_dispatch it is
+      # the default branch, and the job would verify a commit that is not
+      # the one being released.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -49,8 +54,13 @@ jobs:
 
       - id: parse
         name: parse the tag
+        env:
+          # Through the environment, never interpolated into the script: a
+          # workflow_dispatch input is somebody's typing, and `; rm -rf /`
+          # is valid typing.
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="$TAG"
 
           # contrib/gin/v0.1.0 -> module=contrib/gin, version=0.1.0
           # v0.1.0             -> module=.,           version=0.1.0
@@ -70,8 +80,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: the tag is on main
+        env:
+          TAG: ${{ steps.parse.outputs.tag }}
         run: |
-          tag="${{ steps.parse.outputs.tag }}"
+          tag="$TAG"
           git fetch --quiet origin main
           git merge-base --is-ancestor "$tag" origin/main \
             || { echo "::error::$tag is not an ancestor of main"; exit 1; }
@@ -84,6 +96,16 @@ jobs:
       # than against whatever was on a developer's disk.
       - name: the gate passes at this commit
         run: make check
+
+      # And the integration suite, which make check does not include
+      # because it needs a directory. A release that has not been run
+      # against a real server — over plaintext, LDAPS and StartTLS — is a
+      # release nobody has actually tried.
+      - name: the integration suite passes at this commit
+        run: ./scripts/integration.sh --down
+
+      - if: failure()
+        run: docker compose -f integration/compose.yml logs
 
       # A contrib module is developed against the checkout through a
       # replace directive, so this is the first time it is built against
@@ -136,13 +158,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
           fetch-depth: 0
           persist-credentials: false
 
       - id: notes
         name: build the release notes
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="$TAG"
           module="${{ needs.verify.outputs.module }}"
           version="${{ needs.verify.outputs.version }}"
 
@@ -185,8 +210,10 @@ jobs:
         with:
           go-version: stable
       - name: ask the proxy for the new version
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="$TAG"
           module="${{ needs.verify.outputs.module }}"
 
           if [ "$module" = "." ]; then

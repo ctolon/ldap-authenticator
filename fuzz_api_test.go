@@ -16,6 +16,15 @@ import (
 // that no username, however constructed, authenticates as somebody it is
 // not — through the whole package and against a directory that parses
 // filters and DNs for real.
+//
+// Each builds its fixture once, in the F, rather than once per execution.
+// Building a whole authenticator four million times is not what these are
+// testing, and at a hundred thousand executions a second across
+// twenty-eight workers it was enough allocation to leave the coordinator
+// unable to shut the workers down inside its own deadline — a gate that
+// failed with "context deadline exceeded" and nothing to do with the
+// property under test. Reusing one authenticator across executions is also
+// closer to how the package is actually used.
 
 var authFuzzSeeds = []struct{ username, password string }{
 	{"alice", alicePassword},
@@ -43,11 +52,10 @@ func FuzzSearchThenBindAdmitsOnlyTheRealUser(f *testing.F) {
 		f.Add(seed.username, seed.password)
 	}
 
+	dir := newDirectory()
+	auth := searchAuth(f, dir, ldapauth.WithoutRetry())
+
 	f.Fuzz(func(t *testing.T, username, password string) {
-		dir := newDirectory()
-
-		auth := searchAuth(t, dir, ldapauth.WithoutRetry())
-
 		identity, err := auth.Authenticate(t.Context(), username, password)
 
 		if err != nil {
@@ -81,13 +89,15 @@ func FuzzDirectBindStaysInsideItsSubtree(f *testing.F) {
 		f.Add(seed.username, seed.password)
 	}
 
-	f.Fuzz(func(t *testing.T, username, password string) {
-		dir := newDirectory().Add(
-			// The entry a DN injection would be trying to reach.
-			ldaptest.User("uid=root,ou=admins,"+baseDN, "root-password").With("uid", "root"),
-		)
+	dir := newDirectory().Add(
+		// The entry a DN injection would be trying to reach.
+		ldaptest.User("uid=root,ou=admins,"+baseDN, "root-password").With("uid", "root"),
+	)
 
-		auth := directAuth(t, dir, ldapauth.WithoutRetry())
+	auth := directAuth(f, dir, ldapauth.WithoutRetry())
+
+	f.Fuzz(func(t *testing.T, username, password string) {
+		dir.Reset()
 
 		_, _ = auth.Authenticate(t.Context(), username, password)
 
@@ -124,10 +134,11 @@ func FuzzUserSearchFilterStaysOneTerm(f *testing.F) {
 		f.Add(seed.username)
 	}
 
-	f.Fuzz(func(t *testing.T, username string) {
-		dir := newDirectory()
+	dir := newDirectory()
+	auth := searchAuth(f, dir, ldapauth.WithoutRetry())
 
-		auth := searchAuth(t, dir, ldapauth.WithoutRetry())
+	f.Fuzz(func(t *testing.T, username string) {
+		dir.Reset()
 
 		_, _ = auth.Authenticate(t.Context(), username, "irrelevant")
 
@@ -194,4 +205,50 @@ func isDocumentedFailure(err error) bool {
 	}
 
 	return false
+}
+
+// FuzzGroupFilterStaysOneTerm is the end-to-end form of the fix that
+// v1.0 nearly shipped without: whatever the username, the *group* filter
+// that reaches the directory still has the shape the template described.
+//
+// It is a separate target from the user-search one because it exercises a
+// different splice. Under a direct bind the DN in `(member={{user_dn}})`
+// is built from the username, so a username that survives into it
+// unescaped widens a membership test into a prefix match — which is an
+// authorisation bypass rather than a failed login.
+func FuzzGroupFilterStaysOneTerm(f *testing.F) {
+	for _, seed := range authFuzzSeeds {
+		f.Add(seed.username)
+	}
+
+	f.Add("x*")
+	f.Add("a)(objectClass=*")
+	f.Add(`a\`)
+
+	dir := newDirectory()
+
+	auth := newAuthenticator(f, dir,
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+		ldapauth.WithGroupSearch(groupsDN, "(&(objectClass=groupOfNames)(member={{user_dn}}))"),
+		ldapauth.WithNestedGroups(),
+		ldapauth.WithoutRetry(),
+	)
+
+	f.Fuzz(func(t *testing.T, username string) {
+		dir.Reset()
+
+		_, _ = auth.Authenticate(t.Context(), username, alicePassword)
+
+		for _, filter := range dir.Filters() {
+			// The template has two terms and no wildcard. Whatever the
+			// username was, that is still what went out.
+			if got := countUnescaped(filter, '('); got != 3 {
+				t.Fatalf("username %q produced %d filter groupings: %q", username, got, filter)
+			}
+
+			if countUnescaped(filter, '*') != 0 {
+				t.Fatalf("username %q introduced a wildcard: %q", username, filter)
+			}
+		}
+	})
 }

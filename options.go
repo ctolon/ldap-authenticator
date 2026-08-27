@@ -585,9 +585,10 @@ func WithMemberOfAttribute(name string) Option {
 //	)
 //
 // The template may use {{user_dn}}, {{username}}, and {{base_dn}}.
-// {{user_dn}} expands to the DN the directory returned for the
-// authenticated user and is spliced verbatim, because it is already a DN;
-// {{username}} is escaped as a filter value.
+// {{user_dn}} expands to the DN of the authenticated entry. Every
+// placeholder is escaped for RFC 4515, the DNs included: a DN in a filter
+// is an assertion value, and escaping it leaves its commas and equals
+// signs alone while stopping an asterisk in it from widening the match.
 //
 // Use this on directories with no memberOf overlay, or where memberships
 // live on the group rather than on the user — which is the case for

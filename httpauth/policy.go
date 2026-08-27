@@ -195,6 +195,24 @@ func WithMaxBodyBytes(n int64) Option {
 // Realm returns the configured realm.
 func (p *Policy) Realm() string { return p.realm }
 
+// MaxBodyBytes returns the configured login body limit.
+//
+// It is exported because the framework adapters have to apply it
+// themselves, and a limit only the net/http middleware honoured would make
+// "one policy, shared by every adapter" untrue in the one place it is
+// load-bearing.
+func (p *Policy) MaxBodyBytes() int64 { return p.maxBody }
+
+// ShouldSkip reports whether the policy leaves this request alone.
+//
+// Exported for the same reason as MaxBodyBytes. It reports false when no
+// skip predicate is configured, and for a request an adapter cannot
+// represent as an *http.Request — the Fiber one, which is why that
+// adapter's documentation says so.
+func (p *Policy) ShouldSkip(r *http.Request) bool {
+	return r != nil && p.skip != nil && p.skip(r)
+}
+
 // Challenge is the value of the WWW-Authenticate header this policy sends.
 func (p *Policy) Challenge() string {
 	return `Basic realm="` + p.realm + `", charset="UTF-8"`

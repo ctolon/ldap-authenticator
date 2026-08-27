@@ -10,6 +10,11 @@
 # the thing it fixes.
 !testdata/fuzz/
 
+# The CA the integration container generates at first start. It is
+# regenerated on every fresh volume and is worthless outside the test
+# container, so there is nothing to keep and nothing to leak.
+/integration/testdata/
+
 # Editors
 .idea/
 .vscode/

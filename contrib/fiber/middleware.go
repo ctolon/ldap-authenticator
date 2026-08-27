@@ -65,7 +65,7 @@ func LoginHandler(
 	}
 
 	return func(c *fiber.Ctx) error {
-		username, password, err := credentials(c)
+		username, password, err := credentials(c, policy.MaxBodyBytes())
 		if err != nil {
 			return reject(c, policy, err)
 		}
@@ -113,9 +113,19 @@ func MustIdentity(c *fiber.Ctx) ldapauth.Identity {
 
 // credentials reads a username and password from wherever the request put
 // them: the Authorization header, a JSON body, or a form body.
-func credentials(c *fiber.Ctx) (username, password string, err error) {
+func credentials(c *fiber.Ctx, maxBody int64) (username, password string, err error) {
 	if user, pass, ok := basicCredentials(c); ok {
 		return user, pass, nil
+	}
+
+	// Fiber has already read the whole body into memory, bounded by the
+	// app's own BodyLimit rather than by the policy's. Applying the
+	// policy's limit here keeps the two adapters agreeing about what is
+	// too large; it does not keep the memory from being allocated, which
+	// is what fiber.Config.BodyLimit is for and why this adapter's README
+	// says to set it.
+	if int64(len(c.Body())) > maxBody {
+		return "", "", httpauth.ErrMalformedRequest
 	}
 
 	contentType, _, _ := strings.Cut(c.Get(fiber.HeaderContentType), ";")

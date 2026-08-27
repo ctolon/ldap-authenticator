@@ -381,7 +381,7 @@ func (a *Client) searcherFor(r *resolved) Searcher {
 
 			_, err := a.withPooledConn(ctx, func(conn Conn) (*ldap.Entry, error) {
 				var serr error
-				result, serr = a.search(conn, request)
+				result, serr = a.search(ctx, conn, request)
 
 				return nil, serr
 			})
@@ -393,6 +393,6 @@ func (a *Client) searcherFor(r *resolved) Searcher {
 			return nil, ErrClosed
 		}
 
-		return a.search(r.conn, request)
+		return a.search(ctx, r.conn, request)
 	})
 }
