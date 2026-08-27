@@ -1,7 +1,6 @@
 package ldapauth
 
 import (
-	"context"
 	"log/slog"
 	"time"
 )
@@ -33,6 +32,14 @@ const (
 	CacheMiss        = "miss"
 	CacheNegativeHit = "negative_hit"
 	CacheEvicted     = "evicted"
+
+	// CacheCoalesced is a request that waited on an identical
+	// authentication already in flight instead of opening one of its own.
+	CacheCoalesced = "coalesced"
+
+	// CacheError is a cache that could not answer. The authenticator
+	// treats it as a miss and asks the directory.
+	CacheError = "error"
 )
 
 // Metrics receives counters and timings from the authenticator.
@@ -79,12 +86,23 @@ type Metrics interface {
 // in a later release do not break them.
 type NoopMetrics struct{}
 
-func (NoopMetrics) AuthAttempt(string, time.Duration)         {}
-func (NoopMetrics) CacheEvent(string)                         {}
+// AuthAttempt does nothing.
+func (NoopMetrics) AuthAttempt(string, time.Duration) {}
+
+// CacheEvent does nothing.
+func (NoopMetrics) CacheEvent(string) {}
+
+// RetryScheduled does nothing.
 func (NoopMetrics) RetryScheduled(string, int, time.Duration) {}
-func (NoopMetrics) ConnOpened(string)                         {}
-func (NoopMetrics) ConnClosed(string)                         {}
-func (NoopMetrics) PoolStats(int, int)                        {}
+
+// ConnOpened does nothing.
+func (NoopMetrics) ConnOpened(string) {}
+
+// ConnClosed does nothing.
+func (NoopMetrics) ConnClosed(string) {}
+
+// PoolStats does nothing.
+func (NoopMetrics) PoolStats(int, int) {}
 
 // discardLogger drops everything. It is the default logger, so the logging
 // calls in the hot path need no nil check and no level check of their own.
@@ -96,31 +114,16 @@ var discardLogger = slog.New(slog.DiscardHandler)
 // There is no helper here that takes a password, which is the cheapest way
 // to guarantee none is written.
 
-func (a *Authenticator) debug(msg string, args ...any) {
-	a.cfg.logger.LogAttrs(context.Background(), slog.LevelDebug, msg, attrs(args)...)
+func (a *Client) debug(msg string, args ...any) {
+	a.cfg.logger.Debug(msg, args...)
 }
 
-func (a *Authenticator) info(msg string, args ...any) {
-	a.cfg.logger.LogAttrs(context.Background(), slog.LevelInfo, msg, attrs(args)...)
+func (a *Client) info(msg string, args ...any) {
+	a.cfg.logger.Info(msg, args...)
 }
 
-func (a *Authenticator) warn(msg string, args ...any) {
-	a.cfg.logger.LogAttrs(context.Background(), slog.LevelWarn, msg, attrs(args)...)
-}
-
-func attrs(args []any) []slog.Attr {
-	out := make([]slog.Attr, 0, len(args)/2)
-
-	for i := 0; i+1 < len(args); i += 2 {
-		key, ok := args[i].(string)
-		if !ok {
-			continue
-		}
-
-		out = append(out, slog.Any(key, args[i+1]))
-	}
-
-	return out
+func (a *Client) warn(msg string, args ...any) {
+	a.cfg.logger.Warn(msg, args...)
 }
 
 // safeUsername renders a username for a log line or an AuthError, honouring

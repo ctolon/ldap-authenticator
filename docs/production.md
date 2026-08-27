@@ -122,6 +122,41 @@ The negative cache is worth having even at a short TTL: it stops a
 misconfigured client looping on a stale password from reaching the
 directory often enough to lock the account out.
 
+## Several replicas
+
+Nothing is shared between processes unless you share it. Each replica has
+its own pool, its own failover state, and its own cache secret — which
+means, by default, its own cache.
+
+To share one:
+
+```go
+ldapauth.WithCache(30*time.Second),
+ldapauth.WithCacheSecret(secretFromYourSecretManager),
+ldapauth.WithCacheStore(redisCache{client}),
+```
+
+The secret is what makes the sharing work: without it each replica derives
+a different key for the same login, and the shared cache silently never
+hits — a failure mode with no error and a large bill. See
+[extending.md](extending.md) for what a store looks like, and
+[security.md](security.md) for what the secret is worth to an attacker.
+
+Two more things matter at fleet scale:
+
+- **Retry backoff is fully jittered**, so a fleet that lost its directory
+  at the same instant does not come back at the same instant.
+- **`FailoverInOrder` sends every replica to the same server first.** That
+  is usually right — the list is ordered by preference. When the servers
+  are equivalent and you would rather spread the load,
+  `FailoverRoundRobin` or `FailoverRandom`; prefer random when many
+  processes start together, because their round robins would otherwise
+  march in step.
+
+Within one process, identical logins arriving at once are collapsed into a
+single round trip. That is the part of a stampede the cache cannot absorb,
+since the cache only helps once the first attempt has finished.
+
 ## Health checks
 
 ```go
@@ -152,8 +187,12 @@ directory.
 - **`RetryScheduled`, as a rate** — the transport is unreliable. Retries
   are hiding it from your users, which is what they are for, but the
   underlying problem is still there.
-- **`Stats().HealthyServers` below `Stats().Servers`** — failover is in
-  use. Worth a ticket even though nothing is failing.
+- **`Stats(ctx).HealthyServers` below `Stats(ctx).Servers`** — failover is
+  in use. Worth a ticket even though nothing is failing.
+- **`CacheEvent` with `error`** — the cache is not answering. Nothing is
+  failing yet, because a cache that is down falls through to the
+  directory, but the directory is now taking the load the cache was there
+  to absorb.
 
 ## Secrets
 

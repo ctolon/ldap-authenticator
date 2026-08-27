@@ -45,13 +45,14 @@ func retriable(err error) bool {
 		return true
 	}
 
-	switch resultCode(err) {
-	case ldap.LDAPResultBusy,
+	if ldap.IsErrorAnyOf(err,
+		ldap.LDAPResultBusy,
 		ldap.LDAPResultUnavailable,
 		ldap.LDAPResultTimeLimitExceeded,
 		ldap.ErrorNetwork,
 		ldap.ErrorUnexpectedMessage,
-		ldap.ErrorUnexpectedResponse:
+		ldap.ErrorUnexpectedResponse,
+	) {
 		return true
 	}
 
@@ -73,7 +74,7 @@ func retriable(err error) bool {
 // The elapsed budget is checked before sleeping rather than after, so a
 // policy that would sleep past its own deadline gives up immediately
 // instead of sleeping and then reporting that it is out of time.
-func (a *Authenticator) withRetry(ctx context.Context, op string, fn func(context.Context) error) error {
+func (a *Client) withRetry(ctx context.Context, op string, fn func(context.Context) error) error {
 	started := a.cfg.now()
 
 	var err error
@@ -111,7 +112,7 @@ func (a *Authenticator) withRetry(ctx context.Context, op string, fn func(contex
 // wait sleeps for d, or returns early if the context ends or the
 // authenticator is closed. The timer is stopped on every path so a long
 // backoff on a cancelled request does not hold a runtime timer alive.
-func (a *Authenticator) wait(ctx context.Context, d time.Duration) error {
+func (a *Client) wait(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return ctx.Err()
 	}

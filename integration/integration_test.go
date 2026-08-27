@@ -55,7 +55,7 @@ func requireLDAP(t *testing.T) string {
 	return *ldapURL
 }
 
-func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Authenticator {
+func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	base := []ldapauth.Option{
@@ -76,7 +76,7 @@ func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Authenticator {
 	return auth
 }
 
-func serviceAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Authenticator {
+func serviceAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	base := []ldapauth.Option{
@@ -104,8 +104,8 @@ func TestDirectBind(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if !strings.EqualFold(p.DN, aliceDN) {
-		t.Errorf("DN = %q, want %q", p.DN, aliceDN)
+	if !strings.EqualFold(p.GetDN(), aliceDN) {
+		t.Errorf("DN = %q, want %q", p.GetDN(), aliceDN)
 	}
 
 	if _, err := auth.Authenticate(ctx(t), "alice", "wrong"); !errors.Is(err, ldapauth.ErrInvalidCredentials) {
@@ -124,12 +124,12 @@ func TestSearchThenBind(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if p.Email != "alice@example.com" {
-		t.Errorf("Email = %q, want alice@example.com", p.Email)
+	if p.GetEmail() != "alice@example.com" {
+		t.Errorf("Email = %q, want alice@example.com", p.GetEmail())
 	}
 
-	if p.DisplayName != "Alice Example" {
-		t.Errorf("DisplayName = %q, want %q", p.DisplayName, "Alice Example")
+	if p.GetDisplayName() != "Alice Example" {
+		t.Errorf("DisplayName = %q, want %q", p.GetDisplayName(), "Alice Example")
 	}
 }
 
@@ -186,8 +186,8 @@ func TestDNWithACommaRoundTrips(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if !strings.EqualFold(p.DN, awkwardDN) {
-		t.Errorf("DN = %q, want %q", p.DN, awkwardDN)
+	if !strings.EqualFold(p.GetDN(), awkwardDN) {
+		t.Errorf("DN = %q, want %q", p.GetDN(), awkwardDN)
 	}
 }
 
@@ -202,11 +202,11 @@ func TestGroupSearch(t *testing.T) {
 	}
 
 	if !p.InGroup("developers") {
-		t.Errorf("groups = %v, want developers", p.Groups)
+		t.Errorf("groups = %v, want developers", p.GetGroups())
 	}
 
 	if p.InGroup("staff") {
-		t.Errorf("groups = %v, want staff excluded without nesting", p.Groups)
+		t.Errorf("groups = %v, want staff excluded without nesting", p.GetGroups())
 	}
 }
 
@@ -222,7 +222,7 @@ func TestNestedGroupSearch(t *testing.T) {
 	}
 
 	if !p.InGroup("developers") || !p.InGroup("staff") {
-		t.Errorf("groups = %v, want both developers and staff", p.Groups)
+		t.Errorf("groups = %v, want both developers and staff", p.GetGroups())
 	}
 }
 
@@ -234,8 +234,8 @@ func TestLookupNeedsNoPassword(t *testing.T) {
 		t.Fatalf("Lookup: %v", err)
 	}
 
-	if p.Email != "bob@example.com" {
-		t.Errorf("Email = %q, want bob@example.com", p.Email)
+	if p.GetEmail() != "bob@example.com" {
+		t.Errorf("Email = %q, want bob@example.com", p.GetEmail())
 	}
 
 	if _, err := auth.Lookup(ctx(t), "nobody"); !errors.Is(err, ldapauth.ErrUserNotFound) {
@@ -271,7 +271,7 @@ func TestFailoverPastADeadServer(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if stats := auth.Stats(); stats.HealthyServers != 1 {
+	if stats := auth.Stats(ctx(t)); stats.HealthyServers != 1 {
 		t.Errorf("HealthyServers = %d, want 1: the dead server should be in its cooldown", stats.HealthyServers)
 	}
 }
@@ -307,7 +307,7 @@ func TestConcurrentLoginsShareThePool(t *testing.T) {
 		t.Error(err)
 	}
 
-	if stats := auth.Stats(); stats.PoolInUse != 0 {
+	if stats := auth.Stats(ctx(t)); stats.PoolInUse != 0 {
 		t.Errorf("PoolInUse = %d after every login finished, want 0", stats.PoolInUse)
 	}
 }

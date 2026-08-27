@@ -2,8 +2,11 @@ package ldapauth
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/go-ldap/ldap/v3"
 )
 
 // Templates in this package use a single placeholder syntax, {{name}}. The
@@ -29,84 +32,22 @@ const (
 	placeholderUserDN   = "user_dn"
 )
 
-// escapeFilterValue escapes a value for use inside an RFC 4515 search
-// filter. It escapes the set `()*\` and everything outside 0 < c < 0x80,
-// which is a superset of what the RFC requires — the wider net costs
-// nothing and keeps multi-byte trickery out of the filter entirely.
-func escapeFilterValue(s string) string {
-	const hex = "0123456789abcdef"
-
-	escapes := 0
-
-	for i := 0; i < len(s); i++ {
-		if filterMustEscape(s[i]) {
-			escapes++
-		}
-	}
-
-	if escapes == 0 {
-		return s
-	}
-
-	buf := make([]byte, 0, len(s)+escapes*2)
-
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !filterMustEscape(c) {
-			buf = append(buf, c)
-
-			continue
-		}
-
-		buf = append(buf, '\\', hex[c>>4], hex[c&0xf])
-	}
-
-	return string(buf)
-}
-
-func filterMustEscape(c byte) bool {
-	return c > 0x7f || c == '(' || c == ')' || c == '\\' || c == '*' || c == 0
-}
-
-// escapeDNValue escapes a value for use as an RFC 4514 attribute value
-// inside a distinguished name.
+// escapeFilterValue and escapeDNValue are go-ldap's own escapers, named
+// here so that every call site reads as "escape this for the grammar it is
+// going into" rather than as a library call, and so that the package's
+// fuzz targets have a single symbol to aim at.
 //
-// The package carries its own escaper rather than calling the one in
-// go-ldap so that the exact set of escaped characters is pinned by this
-// package's tests and cannot drift underneath us on a dependency bump. The
-// rules: the set `"+,;<>\` and the NUL byte are always escaped, `#` is
-// escaped when it leads, and a space is escaped when it leads or trails.
-// Escaping is done with a leading backslash, except for NUL, which RFC 4514
-// requires be written as the hex pair \00.
-func escapeDNValue(s string) string {
-	if s == "" {
-		return ""
-	}
+// They are not reimplemented. go-ldap already escapes the RFC 4515 set
+// `()*\` plus everything outside 0 < c < 0x80, and the RFC 4514 set
+// `"+,;<>\` plus a leading `#`, a leading or trailing space, and NUL. A
+// second implementation here would be a second thing to keep correct, and
+// the fuzz targets assert the property either way — that what comes out
+// contributes no structure to what it is spliced into.
+var (
+	escapeFilterValue = ldap.EscapeFilter
 
-	var b strings.Builder
-
-	b.Grow(len(s))
-
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-
-		switch {
-		case c == 0:
-			b.WriteString(`\00`)
-		case c == '"' || c == '+' || c == ',' || c == ';' || c == '<' || c == '>' || c == '\\':
-			b.WriteByte('\\')
-			b.WriteByte(c)
-		case c == '#' && i == 0:
-			b.WriteString(`\#`)
-		case c == ' ' && (i == 0 || i == len(s)-1):
-			b.WriteString(`\ `)
-		default:
-			b.WriteByte(c)
-		}
-	}
-
-	return b.String()
-}
+	escapeDNValue = ldap.EscapeDN
+)
 
 // template is a parsed placeholder template. Parsing happens once, at
 // construction, so that a malformed template is a startup failure and the
@@ -159,7 +100,7 @@ func parseTemplate(raw string, allowed ...string) (template, error) {
 		}
 
 		name := strings.TrimSpace(rest[open+2 : open+close])
-		if !contains(allowed, name) {
+		if !slices.Contains(allowed, name) {
 			return t, fmt.Errorf(
 				"%w: template %q uses unknown placeholder {{%s}}, expected one of %s",
 				ErrInvalidOption, t.raw, name, strings.Join(allowed, ", "),
@@ -182,7 +123,7 @@ func parseTemplate(raw string, allowed ...string) (template, error) {
 }
 
 // requires reports whether the template uses the named placeholder.
-func (t template) requires(name string) bool { return contains(t.holes, name) }
+func (t template) requires(name string) bool { return slices.Contains(t.holes, name) }
 
 // expand renders the template, passing every substituted value through
 // escape first. A template that was never parsed renders as the empty
@@ -215,16 +156,6 @@ func (t template) String() string { return t.raw }
 // verbatim is the escape function for values that are already DNs and must
 // not be escaped as attribute values.
 func verbatim(s string) string { return s }
-
-func contains(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-
-	return false
-}
 
 // expandFilter renders a search-filter template, escaping each placeholder
 // for what it is: a username is a value and is escaped for RFC 4515, while

@@ -40,8 +40,8 @@ func main() {
 
 	app := fiber.New()
 
-	app.Post("/login", ldapauthfiber.LoginHandler(auth, func(c *fiber.Ctx, p *ldapauth.Principal) error {
-		return c.JSON(fiber.Map{"dn": p.DN, "groups": p.Groups})
+	app.Post("/login", ldapauthfiber.LoginHandler(auth, func(c *fiber.Ctx, identity ldapauth.Identity) error {
+		return c.JSON(fiber.Map{"dn": identity.GetDN(), "groups": identity.GetGroups()})
 	}))
 
 	app.Use(ldapauthfiber.BasicAuth(auth,
@@ -50,7 +50,7 @@ func main() {
 	))
 
 	app.Get("/me", func(c *fiber.Ctx) error {
-		return c.JSON(ldapauthfiber.MustPrincipal(c))
+		return c.JSON(ldapauthfiber.MustIdentity(c))
 	})
 
 	log.Fatal(app.Listen(":8080"))

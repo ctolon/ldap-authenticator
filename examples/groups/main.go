@@ -78,15 +78,17 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	principal, err := auth.Authenticate(ctx, *username, *password)
+	identity, err := auth.Authenticate(ctx, *username, *password)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "failed:", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("%s is in %d groups:\n", principal.DN, len(principal.Groups))
+	groups := identity.GetGroups()
 
-	for _, group := range principal.Groups {
+	fmt.Printf("%s is in %d groups:\n", identity.GetDN(), len(groups))
+
+	for _, group := range groups {
 		fmt.Println(" ", group)
 	}
 }

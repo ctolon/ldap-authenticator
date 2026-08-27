@@ -1,33 +1,10 @@
-// Package ldaptest is an in-memory LDAP directory for tests.
-//
-// It speaks enough of the protocol to be worth testing against: real
-// filter parsing, real scopes, real bind semantics — including the one
-// that matters most, where a bind with an empty password succeeds as an
-// unauthenticated bind exactly as a conforming server would. A fake that
-// quietly rejected the empty password would make the test that proves
-// this library never sends one pass for the wrong reason.
-//
-// It is not a server. Nothing here listens on a socket; a Directory hands
-// out an [ldapauth.Dialer] whose connections talk to the map directly. For
-// tests against a real directory, see the integration suite.
-//
-//	dir := ldaptest.New(
-//	    ldaptest.User("uid=alice,ou=people,dc=example,dc=com", "s3cret").
-//	        With("uid", "alice").
-//	        With("mail", "alice@example.com"),
-//	)
-//
-//	auth, err := ldapauth.New(
-//	    ldapauth.WithURL("ldap://memory"),
-//	    ldapauth.WithDialer(dir.Dialer()),
-//	    ldapauth.WithDirectBind("uid={{username}},ou=people,dc=example,dc=com"),
-//	)
 package ldaptest
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -92,10 +69,16 @@ func (e *Entry) Values(name string) []string {
 // the point of recording it is to let a test assert that an empty one was
 // never sent.
 type Bind struct {
+	// DN is the distinguished name the bind was attempted as. It is empty
+	// for an anonymous bind.
 	DN string
 
+	// Password is what was presented. It is recorded on purpose: the
+	// point of recording it is to let a test assert that an empty one was
+	// never sent.
 	Password string
 
+	// URL is the server the connection was opened to.
 	URL string
 }
 
@@ -117,6 +100,8 @@ type Directory struct {
 
 	closed int
 
+	paged int
+
 	// BindHook, if set, runs before a bind is evaluated. Returning an
 	// error makes the bind fail with that error.
 	BindHook func(dn, password string) error
@@ -136,12 +121,32 @@ func New(entries ...*Entry) *Directory {
 	}
 }
 
-// Add adds an entry.
+// Add adds entries, replacing any that already exist under the same DN.
+//
+// Replacing rather than appending is what a directory does, and it is the
+// behaviour a test wants: appending a second entry with the same DN would
+// leave the first one shadowing it in every search, and the test would
+// fail for a reason that has nothing to do with what it was testing.
 func (d *Directory) Add(entries ...*Entry) *Directory {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.entries = append(d.entries, entries...)
+	for _, entry := range entries {
+		replaced := false
+
+		for i, existing := range d.entries {
+			if strings.EqualFold(existing.DN, entry.DN) {
+				d.entries[i] = entry
+				replaced = true
+
+				break
+			}
+		}
+
+		if !replaced {
+			d.entries = append(d.entries, entry)
+		}
+	}
 
 	return d
 }
@@ -200,6 +205,16 @@ func (d *Directory) Conns() (opened, closed int) {
 	return d.opened, d.closed
 }
 
+// PagedSearches reports how many searches were issued with a paged
+// results control, for a test that wants to know whether WithPagingSize
+// reached the wire.
+func (d *Directory) PagedSearches() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.paged
+}
+
 // Reset clears the recorded binds and searches, leaving the entries alone.
 func (d *Directory) Reset() {
 	d.mu.Lock()
@@ -207,6 +222,7 @@ func (d *Directory) Reset() {
 
 	d.binds = nil
 	d.searches = nil
+	d.paged = 0
 }
 
 // Dialer returns a dialer that connects to this directory whatever URL it
@@ -355,6 +371,10 @@ func (c *conn) Search(request *ldap.SearchRequest) (*ldap.SearchResult, error) {
 }
 
 func (c *conn) SearchWithPaging(request *ldap.SearchRequest, _ uint32) (*ldap.SearchResult, error) {
+	c.dir.mu.Lock()
+	c.dir.paged++
+	c.dir.mu.Unlock()
+
 	return c.Search(request)
 }
 
@@ -493,7 +513,7 @@ func project(entry *Entry, wanted []string) *ldap.Entry {
 	out := &ldap.Entry{DN: entry.DN}
 
 	for name, values := range entry.Attributes {
-		if len(wanted) > 0 && !containsFold(wanted, name) {
+		if len(wanted) > 0 && !slices.ContainsFunc(wanted, func(w string) bool { return strings.EqualFold(w, name) }) {
 			continue
 		}
 
@@ -506,37 +526,63 @@ func project(entry *Entry, wanted []string) *ldap.Entry {
 	return out
 }
 
-func containsFold(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if strings.EqualFold(s, needle) {
-			return true
-		}
+// parsedDNs memoises DN parsing.
+//
+// A fake is allowed to be slower than a server, but not so much slower
+// that it distorts a benchmark of the code calling it: parsing is the most
+// expensive thing this package does, the set of distinct DNs in a test is
+// tiny, and they never change.
+var parsedDNs sync.Map
+
+func parseDN(dn string) (*ldap.DN, bool) {
+	if cached, ok := parsedDNs.Load(dn); ok {
+		parsed, ok := cached.(*ldap.DN)
+
+		return parsed, ok
 	}
 
-	return false
+	parsed, err := ldap.ParseDN(dn)
+	if err != nil {
+		parsedDNs.Store(dn, nil)
+
+		return nil, false
+	}
+
+	parsedDNs.Store(dn, parsed)
+
+	return parsed, true
 }
 
 // inScope applies an LDAP search scope to a DN.
+//
+// The comparison goes through go-ldap's own DN parser rather than through
+// string suffixes, so that a base written with different spacing or
+// escaping than the entry still matches — which is what a real server
+// does, and what a fake matching on strings would get wrong in exactly the
+// cases a test is written to catch.
 func inScope(dn, base string, scope int) bool {
 	if base == "" {
 		return true
 	}
 
-	dnLower := strings.ToLower(strings.TrimSpace(dn))
-	baseLower := strings.ToLower(strings.TrimSpace(base))
+	parsedDN, ok := parseDN(dn)
+	if !ok {
+		return false
+	}
+
+	parsedBase, ok := parseDN(base)
+	if !ok {
+		return false
+	}
 
 	switch scope {
 	case ldap.ScopeBaseObject:
-		return dnLower == baseLower
+		return parsedDN.EqualFold(parsedBase)
 
 	case ldap.ScopeSingleLevel:
-		if !strings.HasSuffix(dnLower, ","+baseLower) {
-			return false
-		}
-
-		return !strings.Contains(strings.TrimSuffix(dnLower, ","+baseLower), ",")
+		return len(parsedDN.RDNs) == len(parsedBase.RDNs)+1 && parsedBase.AncestorOfFold(parsedDN)
 
 	default:
-		return dnLower == baseLower || strings.HasSuffix(dnLower, ","+baseLower)
+		return parsedDN.EqualFold(parsedBase) || parsedBase.AncestorOfFold(parsedDN)
 	}
 }

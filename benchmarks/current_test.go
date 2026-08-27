@@ -40,7 +40,7 @@ func directory() *ldaptest.Directory {
 	)
 }
 
-func build(b *testing.B, opts ...ldapauth.Option) *ldapauth.Authenticator {
+func build(b *testing.B, opts ...ldapauth.Option) *ldapauth.Client {
 	b.Helper()
 
 	base := []ldapauth.Option{

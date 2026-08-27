@@ -32,6 +32,13 @@ submits on the first keystroke, or a client retrying with a cleared field.
 It is refused before any network call. That is the point: this is the
 request that a naive authenticator would answer with "authenticated".
 
+### `ldapauth: invalid password`
+
+Not "the password was wrong" — that is `ldapauth: invalid credentials` —
+but "this cannot be a password". It exceeded `WithPasswordMaxLength`, which
+defaults to a kilobyte. Something upstream is putting a request body, or a
+token, into the password field.
+
 ### `ldapauth: no LDAP server available`
 
 Every configured URL failed to dial. The joined error underneath names each
@@ -112,6 +119,17 @@ password, a service with a stale credential in its configuration.
 
 `WithNegativeCache` blunts it: repeated failures with the same wrong
 password are served from memory rather than reaching the directory.
+
+### A shared cache never hits
+
+Every replica has its own cache secret unless you give them one, so each
+derives a different key for the same login and the shared store fills up
+with entries nobody else can find. `WithCacheSecret`, the same value
+everywhere.
+
+There is no error for this, which is what makes it worth checking: the
+symptom is a cache hit rate near zero and a directory under more load than
+the cache was supposed to leave it.
 
 ### It works in tests and fails against the real directory
 

@@ -2,6 +2,7 @@ package ldapauth_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,7 +67,7 @@ func newDirectory() *ldaptest.Directory {
 
 // newAuthenticator builds an authenticator against dir, with the given
 // options appended to the ones every test needs. It registers Close.
-func newAuthenticator(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Authenticator {
+func newAuthenticator(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	base := []ldapauth.Option{
@@ -86,7 +87,7 @@ func newAuthenticator(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Op
 
 // searchAuth is the search-then-bind fixture, which is what most tests
 // want: it exercises the pool, the service bind, and the user search.
-func searchAuth(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Authenticator {
+func searchAuth(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	base := []ldapauth.Option{
@@ -98,7 +99,7 @@ func searchAuth(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) 
 }
 
 // directAuth is the direct-bind fixture, with no service account at all.
-func directAuth(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Authenticator {
+func directAuth(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	base := []ldapauth.Option{
@@ -106,6 +107,17 @@ func directAuth(t *testing.T, dir *ldaptest.Directory, opts ...ldapauth.Option) 
 	}
 
 	return newAuthenticator(t, dir, append(base, opts...)...)
+}
+
+// passwordUser builds a replacement entry for one of the fixture's users,
+// so that a test can pick a password distinctive enough to search for.
+func passwordUser(dn, password string) *ldaptest.Entry {
+	return ldaptest.User(dn, password).
+		With("uid", strings.TrimSuffix(strings.TrimPrefix(dn, "uid="), ","+peopleDN)).
+		With("cn", "Fixture User").
+		With("mail", "fixture@example.com").
+		With("objectClass", "inetOrgPerson").
+		With("memberOf", devsDN)
 }
 
 // testContext is a context that dies with the test.

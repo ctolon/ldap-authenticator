@@ -20,7 +20,7 @@ const (
 	devsDN   = "cn=devs,ou=groups,dc=example,dc=com"
 )
 
-func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Authenticator {
+func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	dir := ldaptest.New(
@@ -47,7 +47,7 @@ func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Authenticator {
 	return auth
 }
 
-func newEngine(t *testing.T, auth *ldapauth.Authenticator, opts ...httpauth.Option) *gin.Engine {
+func newEngine(t *testing.T, auth *ldapauth.Client, opts ...httpauth.Option) *gin.Engine {
 	t.Helper()
 
 	gin.SetMode(gin.TestMode)
@@ -55,7 +55,7 @@ func newEngine(t *testing.T, auth *ldapauth.Authenticator, opts ...httpauth.Opti
 	r := gin.New()
 	r.Use(ldapauthgin.BasicAuth(auth, opts...))
 	r.GET("/private", func(c *gin.Context) {
-		c.String(http.StatusOK, ldapauthgin.MustPrincipal(c).Username)
+		c.String(http.StatusOK, ldapauthgin.MustIdentity(c).GetUsername())
 	})
 
 	return r
@@ -156,8 +156,8 @@ func TestLoginHandler(t *testing.T) {
 
 	r := gin.New()
 	r.POST("/login", ldapauthgin.LoginHandler(newAuth(t),
-		func(c *gin.Context, p *ldapauth.Principal) {
-			c.String(http.StatusOK, p.DN)
+		func(c *gin.Context, identity ldapauth.Identity) {
+			c.String(http.StatusOK, identity.GetDN())
 		},
 	))
 
@@ -180,11 +180,11 @@ func TestPrincipalReachesBothContexts(t *testing.T) {
 	r := gin.New()
 	r.Use(ldapauthgin.BasicAuth(newAuth(t)))
 	r.GET("/private", func(c *gin.Context) {
-		if _, ok := ldapauthgin.PrincipalFrom(c); !ok {
+		if _, ok := ldapauthgin.IdentityFrom(c); !ok {
 			t.Error("the principal is missing from the Gin context")
 		}
 
-		if _, ok := httpauth.PrincipalFrom(c.Request.Context()); !ok {
+		if _, ok := httpauth.IdentityFrom(c.Request.Context()); !ok {
 			t.Error("the principal is missing from the request context")
 		}
 

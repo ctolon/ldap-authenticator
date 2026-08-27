@@ -23,12 +23,12 @@ func TestDirectBindAuthenticates(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if p.DN != aliceDN {
-		t.Errorf("DN = %q, want %q", p.DN, aliceDN)
+	if p.GetDN() != aliceDN {
+		t.Errorf("DN = %q, want %q", p.GetDN(), aliceDN)
 	}
 
-	if p.Username != "alice" {
-		t.Errorf("Username = %q, want the username as supplied", p.Username)
+	if p.GetUsername() != "alice" {
+		t.Errorf("Username = %q, want the username as supplied", p.GetUsername())
 	}
 
 	binds := dir.Binds()
@@ -52,8 +52,8 @@ func TestSearchThenBindAuthenticates(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if p.DN != aliceDN {
-		t.Errorf("DN = %q, want %q", p.DN, aliceDN)
+	if p.GetDN() != aliceDN {
+		t.Errorf("DN = %q, want %q", p.GetDN(), aliceDN)
 	}
 
 	binds := dir.Binds()
@@ -299,19 +299,19 @@ func TestAttributesAreMapped(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if p.DisplayName != "Alice Example" {
-		t.Errorf("DisplayName = %q, want %q", p.DisplayName, "Alice Example")
+	if p.GetDisplayName() != "Alice Example" {
+		t.Errorf("DisplayName = %q, want %q", p.GetDisplayName(), "Alice Example")
 	}
 
-	if p.Email != "alice@example.com" {
-		t.Errorf("Email = %q, want %q", p.Email, "alice@example.com")
+	if p.GetEmail() != "alice@example.com" {
+		t.Errorf("Email = %q, want %q", p.GetEmail(), "alice@example.com")
 	}
 
-	if got := p.Attribute("objectclass"); got != "inetOrgPerson" {
+	if got := p.GetAttribute("objectclass"); got != "inetOrgPerson" {
 		t.Errorf("Attribute lookup is case-sensitive: got %q", got)
 	}
 
-	if got := p.Attribute("nosuchattribute"); got != "" {
+	if got := p.GetAttribute("nosuchattribute"); got != "" {
 		t.Errorf("missing attribute = %q, want empty", got)
 	}
 }
@@ -329,8 +329,8 @@ func TestDirectBindReadsAttributesOverTheUsersOwnConnection(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if p.Email != "alice@example.com" {
-		t.Errorf("Email = %q, want it read over the user's own connection", p.Email)
+	if p.GetEmail() != "alice@example.com" {
+		t.Errorf("Email = %q, want it read over the user's own connection", p.GetEmail())
 	}
 
 	for _, bind := range dir.Binds() {
@@ -419,8 +419,8 @@ func TestLookupNeedsNoPassword(t *testing.T) {
 		t.Fatalf("Lookup: %v", err)
 	}
 
-	if p.Email != "alice@example.com" {
-		t.Errorf("Email = %q, want it populated", p.Email)
+	if p.GetEmail() != "alice@example.com" {
+		t.Errorf("Email = %q, want it populated", p.GetEmail())
 	}
 
 	for _, bind := range dir.Binds() {

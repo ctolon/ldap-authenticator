@@ -59,7 +59,7 @@ func Example_directBind() {
 		return
 	}
 
-	fmt.Println(principal.DN)
+	fmt.Println(principal.GetDN())
 	// Output: uid=alice,ou=people,dc=example,dc=com
 }
 
@@ -92,7 +92,7 @@ func Example_searchThenBind() {
 		return
 	}
 
-	fmt.Println(principal.DisplayName, principal.Email)
+	fmt.Println(principal.GetDisplayName(), principal.GetEmail())
 	// Output: Alice Example alice@example.com
 }
 
@@ -120,7 +120,7 @@ func Example_groups() {
 		return
 	}
 
-	fmt.Println(principal.Groups, principal.InGroup("developers"))
+	fmt.Println(principal.GetGroups(), principal.InGroup("developers"))
 	// Output: [developers] true
 }
 
@@ -231,8 +231,179 @@ func ExampleAuthenticator_Authenticate_httpBasic() {
 			return
 		}
 
-		fmt.Fprintln(w, "hello", principal.Username)
+		fmt.Fprintln(w, "hello", principal.GetUsername())
 	}
 
 	_ = handler
+}
+
+// A custom mapper produces the application's own user type. Everything
+// downstream keeps working because it depends on [ldapauth.Identity]
+// rather than on the concrete type.
+func ExampleWithPrincipalMapper() {
+	auth, err := ldapauth.New(
+		ldapauth.WithURL("ldaps://dc1.example.com:636"),
+		ldapauth.WithDirectBind("uid={{username}},ou=people,dc=example,dc=com"),
+		ldapauth.WithAttributes("mail"),
+
+		ldapauth.WithPrincipalMapper(ldapauth.PrincipalMapperFunc(
+			func(m ldapauth.Mapping) (ldapauth.Identity, error) {
+				// Principal.Extra is for the common case: a type of your
+				// own is only needed when you want your own methods.
+				return &ldapauth.Principal{
+					DN:       m.DN,
+					Username: m.Username,
+					Groups:   m.Groups,
+					Extra:    tenantFor(m.Username),
+				}, nil
+			},
+		)),
+
+		ldapauth.WithDialer(exampleDirectory().Dialer()),
+	)
+	if err != nil {
+		fmt.Println("configuration:", err)
+
+		return
+	}
+	defer auth.Close()
+
+	identity, err := auth.Authenticate(context.Background(), "alice", "s3cret")
+	if err != nil {
+		fmt.Println("authentication:", err)
+
+		return
+	}
+
+	principal, _ := ldapauth.AsPrincipal(identity)
+
+	fmt.Println(principal.Username, principal.Extra)
+	// Output: alice acme
+}
+
+func tenantFor(string) string { return "acme" }
+
+// A custom resolver takes groups from somewhere the directory is not. It
+// replaces the built-in resolution rather than adding to it, so one that
+// wants both should ask the directory itself through [ldapauth.GroupRequest].
+func ExampleWithGroupResolver() {
+	auth, err := ldapauth.New(
+		ldapauth.WithURL("ldaps://dc1.example.com:636"),
+		ldapauth.WithDirectBind("uid={{username}},ou=people,dc=example,dc=com"),
+
+		ldapauth.WithGroupResolver(ldapauth.GroupResolverFunc(
+			func(_ context.Context, request ldapauth.GroupRequest) ([]string, error) {
+				return rolesFor(request.DN), nil
+			},
+		)),
+
+		ldapauth.WithDialer(exampleDirectory().Dialer()),
+	)
+	if err != nil {
+		fmt.Println("configuration:", err)
+
+		return
+	}
+	defer auth.Close()
+
+	identity, err := auth.Authenticate(context.Background(), "alice", "s3cret")
+	if err != nil {
+		fmt.Println("authentication:", err)
+
+		return
+	}
+
+	fmt.Println(identity.GetGroups())
+	// Output: [billing:read billing:write]
+}
+
+func rolesFor(string) []string { return []string{"billing:read", "billing:write"} }
+
+// Reading an identity without a password, for when authentication happened
+// somewhere else — a SAML assertion, an OIDC token, an authenticating
+// proxy. Unlike Authenticate, this distinguishes a missing user: the
+// caller already knows who they are asking about.
+func ExampleClient_Lookup() {
+	auth, err := ldapauth.New(
+		ldapauth.WithURL("ldaps://dc1.example.com:636"),
+		ldapauth.WithServiceAccount("cn=readonly,dc=example,dc=com", "service-password"),
+		ldapauth.WithUserSearch("ou=people,dc=example,dc=com", "(uid={{username}})"),
+		ldapauth.WithEmailAttribute("mail"),
+
+		ldapauth.WithDialer(exampleDirectory().Dialer()),
+	)
+	if err != nil {
+		fmt.Println("configuration:", err)
+
+		return
+	}
+	defer auth.Close()
+
+	identity, err := auth.Lookup(context.Background(), "alice")
+	if err != nil {
+		fmt.Println("lookup:", err)
+
+		return
+	}
+
+	fmt.Println(identity.GetEmail())
+
+	if _, err := auth.Lookup(context.Background(), "nobody"); errors.Is(err, ldapauth.ErrUserNotFound) {
+		fmt.Println("nobody is not in the directory")
+	}
+	// Output:
+	// alice@example.com
+	// nobody is not in the directory
+}
+
+// Depending on the interface rather than the type is what lets a
+// deployment wrap the real authenticator — with a circuit breaker, a
+// second directory, or a local account for the break-glass user — without
+// anything downstream knowing.
+func ExampleAuthenticator() {
+	auth, err := ldapauth.New(
+		ldapauth.WithURL("ldaps://dc1.example.com:636"),
+		ldapauth.WithDirectBind("uid={{username}},ou=people,dc=example,dc=com"),
+
+		ldapauth.WithDialer(exampleDirectory().Dialer()),
+	)
+	if err != nil {
+		fmt.Println("configuration:", err)
+
+		return
+	}
+	defer auth.Close()
+
+	// Embedding the interface means a method added to Authenticator in a
+	// later release passes straight through rather than breaking this.
+	var wrapped ldapauth.Authenticator = breakGlass{Authenticator: auth}
+
+	for _, username := range []string{"alice", "root"} {
+		identity, err := wrapped.Authenticate(context.Background(), username, "s3cret")
+		if err != nil {
+			fmt.Println(username, "rejected")
+
+			continue
+		}
+
+		fmt.Println(username, "->", identity.GetDN())
+	}
+	// Output:
+	// alice -> uid=alice,ou=people,dc=example,dc=com
+	// root -> local:root
+}
+
+type breakGlass struct {
+	ldapauth.Authenticator
+}
+
+func (b breakGlass) Authenticate(
+	ctx context.Context,
+	username, password string,
+) (ldapauth.Identity, error) {
+	if username == "root" && password == "s3cret" {
+		return &ldapauth.Principal{DN: "local:root", Username: "root", Groups: []string{"admin"}}, nil
+	}
+
+	return b.Authenticator.Authenticate(ctx, username, password)
 }

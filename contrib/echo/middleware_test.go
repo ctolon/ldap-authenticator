@@ -20,7 +20,7 @@ const (
 	devsDN   = "cn=devs,ou=groups,dc=example,dc=com"
 )
 
-func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Authenticator {
+func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	dir := ldaptest.New(
@@ -47,14 +47,14 @@ func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Authenticator {
 	return auth
 }
 
-func newServer(t *testing.T, auth *ldapauth.Authenticator, opts ...httpauth.Option) *echo.Echo {
+func newServer(t *testing.T, auth *ldapauth.Client, opts ...httpauth.Option) *echo.Echo {
 	t.Helper()
 
 	e := echo.New()
 	e.HideBanner = true
 	e.Use(ldapauthecho.BasicAuth(auth, opts...))
 	e.GET("/private", func(c echo.Context) error {
-		return c.String(http.StatusOK, ldapauthecho.MustPrincipal(c).Username)
+		return c.String(http.StatusOK, ldapauthecho.MustIdentity(c).GetUsername())
 	})
 
 	return e
@@ -147,8 +147,8 @@ func TestLoginHandler(t *testing.T) {
 	e := echo.New()
 	e.HideBanner = true
 	e.POST("/login", ldapauthecho.LoginHandler(newAuth(t),
-		func(c echo.Context, p *ldapauth.Principal) error {
-			return c.String(http.StatusOK, p.DN)
+		func(c echo.Context, identity ldapauth.Identity) error {
+			return c.String(http.StatusOK, identity.GetDN())
 		},
 	))
 
@@ -170,11 +170,11 @@ func TestPrincipalReachesBothContexts(t *testing.T) {
 	e.HideBanner = true
 	e.Use(ldapauthecho.BasicAuth(newAuth(t)))
 	e.GET("/private", func(c echo.Context) error {
-		if _, ok := ldapauthecho.PrincipalFrom(c); !ok {
+		if _, ok := ldapauthecho.IdentityFrom(c); !ok {
 			t.Error("the principal is missing from the Echo context")
 		}
 
-		if _, ok := httpauth.PrincipalFrom(c.Request().Context()); !ok {
+		if _, ok := httpauth.IdentityFrom(c.Request().Context()); !ok {
 			t.Error("the principal is missing from the request context")
 		}
 

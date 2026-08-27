@@ -1,15 +1,3 @@
-// Package ldapauthecho is Echo middleware for github.com/ctolon/ldap-authenticator.
-//
-// It is a separate module so that the root package can promise a single
-// dependency and mean it. The policy — realms, group requirements, status
-// codes, response padding — lives in the httpauth package of the root
-// module and is shared with the other framework adapters.
-//
-//	e := echo.New()
-//	e.Use(ldapauthecho.BasicAuth(auth, httpauth.RequireAnyGroup("developers")))
-//	e.GET("/me", func(c echo.Context) error {
-//	    return c.JSON(200, ldapauthecho.MustPrincipal(c))
-//	})
 package ldapauthecho
 
 import (
@@ -19,9 +7,9 @@ import (
 	"github.com/ctolon/ldap-authenticator/httpauth"
 )
 
-// ContextKey is the key the principal is stored under in the Echo context,
+// ContextKey is the key the identity is stored under in the Echo context,
 // for handlers that would rather use c.Get than the request context.
-const ContextKey = "ldapauth.principal"
+const ContextKey = "ldapauth.identity"
 
 // BasicAuth returns middleware that authenticates every request with HTTP
 // Basic credentials.
@@ -29,7 +17,7 @@ const ContextKey = "ldapauth.principal"
 // It writes the rejection itself and returns nil rather than returning an
 // echo.HTTPError, so that Echo's error handler cannot turn a bare 401 into
 // a response body describing why the login failed.
-func BasicAuth(auth *ldapauth.Authenticator, opts ...httpauth.Option) echo.MiddlewareFunc {
+func BasicAuth(auth ldapauth.Authenticator, opts ...httpauth.Option) echo.MiddlewareFunc {
 	policy, err := httpauth.NewPolicy(opts...)
 	if err != nil {
 		panic(err)
@@ -50,14 +38,14 @@ func BasicAuth(auth *ldapauth.Authenticator, opts ...httpauth.Option) echo.Middl
 				return nil
 			}
 
-			principal, err := policy.Authenticate(request.Context(), auth, username, password)
+			identity, err := policy.Authenticate(request.Context(), auth, username, password)
 			if err != nil {
 				policy.Reject(c.Response(), request, err)
 
 				return nil
 			}
 
-			store(c, principal)
+			store(c, identity)
 
 			return next(c)
 		}
@@ -68,8 +56,8 @@ func BasicAuth(auth *ldapauth.Authenticator, opts ...httpauth.Option) echo.Middl
 // JSON body, form body, or Basic header — and hands the authenticated
 // principal to onSuccess.
 func LoginHandler(
-	auth *ldapauth.Authenticator,
-	onSuccess func(c echo.Context, p *ldapauth.Principal) error,
+	auth ldapauth.Authenticator,
+	onSuccess func(c echo.Context, p ldapauth.Identity) error,
 	opts ...httpauth.Option,
 ) echo.HandlerFunc {
 	policy, err := httpauth.NewPolicy(opts...)
@@ -95,40 +83,52 @@ func LoginHandler(
 			return nil
 		}
 
-		principal, err := policy.Authenticate(request.Context(), auth, username, password)
+		identity, err := policy.Authenticate(request.Context(), auth, username, password)
 		if err != nil {
 			policy.Reject(c.Response(), request, err)
 
 			return nil
 		}
 
-		store(c, principal)
+		store(c, identity)
 
-		return onSuccess(c, principal)
+		return onSuccess(c, identity)
 	}
 }
 
-// PrincipalFrom returns the principal the middleware authenticated.
+// IdentityFrom returns the identity the middleware authenticated.
+func IdentityFrom(c echo.Context) (ldapauth.Identity, bool) {
+	if identity, ok := c.Get(ContextKey).(ldapauth.Identity); ok {
+		return identity, true
+	}
+
+	return httpauth.IdentityFrom(c.Request().Context())
+}
+
+// PrincipalFrom returns the identity as the concrete
+// [ldapauth.Principal], for the common case where the mapper was not
+// replaced and reading fields is nicer than calling accessors.
 func PrincipalFrom(c echo.Context) (*ldapauth.Principal, bool) {
-	if p, ok := c.Get(ContextKey).(*ldapauth.Principal); ok {
-		return p, true
-	}
-
-	return httpauth.PrincipalFrom(c.Request().Context())
-}
-
-// MustPrincipal returns the authenticated principal and panics if there is
-// none, for handlers that are only ever mounted behind BasicAuth.
-func MustPrincipal(c echo.Context) *ldapauth.Principal {
-	p, ok := PrincipalFrom(c)
+	identity, ok := IdentityFrom(c)
 	if !ok {
-		panic("ldapauthecho: no principal in context; the handler is not behind BasicAuth")
+		return nil, false
 	}
 
-	return p
+	return ldapauth.AsPrincipal(identity)
 }
 
-func store(c echo.Context, p *ldapauth.Principal) {
-	c.Set(ContextKey, p)
-	c.SetRequest(c.Request().WithContext(httpauth.WithPrincipal(c.Request().Context(), p)))
+// MustIdentity returns the authenticated identity and panics if there is
+// none, for handlers that are only ever mounted behind BasicAuth.
+func MustIdentity(c echo.Context) ldapauth.Identity {
+	identity, ok := IdentityFrom(c)
+	if !ok {
+		panic("ldapauthecho: no identity in context; the handler is not behind BasicAuth")
+	}
+
+	return identity
+}
+
+func store(c echo.Context, identity ldapauth.Identity) {
+	c.Set(ContextKey, identity)
+	c.SetRequest(c.Request().WithContext(httpauth.WithIdentity(c.Request().Context(), identity)))
 }

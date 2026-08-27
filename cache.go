@@ -2,97 +2,136 @@ package ldapauth
 
 import (
 	"container/list"
-	"crypto/hmac"
+	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"strings"
 	"sync"
 	"time"
 )
 
-// cache remembers authentication outcomes for a short while.
-//
-// The thing to understand about it is what is stored and what is not. The
-// key is an HMAC-SHA-256 of the username and password under a key drawn
-// from the system CSPRNG when the authenticator is built and never
-// written down. The value is the outcome. A memory dump of a process
-// using this cache yields no password and nothing a password can be
-// recovered from, and the key does not survive the process, so two runs
-// of the same program produce unrelated keys for the same credentials.
-//
-// What it costs is freshness: for the length of the TTL, a disabled
-// account, a changed password, or a revoked group membership still works.
-// MaxCacheTTL caps that at five minutes and there is no way to raise it.
-type cache struct {
-	// secret keys the HMAC. It is per-authenticator and per-process.
-	secret []byte
+// cacheSecretLength is the size of the key that turns a credential into a
+// cache key. Thirty-two bytes is HMAC-SHA-256's block-optimal length and
+// well past the point where guessing is the attack anybody would choose.
+const cacheSecretLength = 32
 
+// randomSecret draws a cache secret from the system CSPRNG.
+func randomSecret() ([]byte, error) {
+	secret := make([]byte, cacheSecretLength)
+
+	if _, err := rand.Read(secret); err != nil {
+		return nil, err
+	}
+
+	return secret, nil
+}
+
+// A Cache remembers authentication outcomes for a short while.
+//
+// The package ships an in-memory one, built by [WithCache]. Replace it with
+// [WithCacheStore] when several replicas should share a cache — a Redis or
+// memcached implementation is a few dozen lines against this interface.
+//
+// # What a Cache is given
+//
+// Keys are opaque. The authenticator derives each one as an HMAC of the
+// username and password under a secret it holds, so an implementation
+// never sees a credential and a cache dump never yields one. By default
+// the secret is drawn from the system CSPRNG at startup, which makes keys
+// per-process; [WithCacheSecret] sets a shared one, which is what a shared
+// cache needs in order to be shared.
+//
+// The username is passed alongside the key, unhashed, so that
+// InvalidateUser can work without knowing the password. If that is more
+// than you want to store, hash it — the authenticator only ever passes the
+// same string back to InvalidateUser.
+//
+// # Failure
+//
+// Every method may return an error, and the authenticator treats one as a
+// miss: it logs it and asks the directory. A cache that is down must never
+// be a directory that is down.
+//
+// Implementations must be safe for concurrent use.
+type Cache interface {
+	// Get returns the cached outcome for key. A hit with a nil Identity is
+	// a cached rejection.
+	Get(ctx context.Context, key string) (identity Identity, hit bool, err error)
+
+	// Set records an outcome for ttl. A nil identity records a rejection.
+	// A non-positive ttl records nothing.
+	Set(ctx context.Context, key, username string, identity Identity, ttl time.Duration) error
+
+	// InvalidateUser drops every entry for one account, whatever password
+	// keyed it, and reports how many it dropped.
+	InvalidateUser(ctx context.Context, username string) (int, error)
+
+	// InvalidateAll drops everything and reports how many it dropped.
+	InvalidateAll(ctx context.Context) (int, error)
+
+	// Len reports how many entries are held, for Stats. An implementation
+	// that cannot answer cheaply should return -1.
+	Len(ctx context.Context) (int, error)
+}
+
+// memoryCache is the in-memory [Cache] this package builds by default.
+//
+// It is a TTL cache with a size bound, not an LRU: reads do not promote,
+// because an entry's expiry is absolute either way and promoting on read
+// would only keep a hot entry alive past nothing.
+type memoryCache struct {
 	maxEntries int
 
 	now func() time.Time
 
 	mu      sync.Mutex
 	entries map[string]*list.Element
+	order   *list.List
+}
 
-	// order is the eviction order, oldest at the front. Reads do not
-	// promote: this is a TTL cache with a size bound, not an LRU, and
-	// promoting on read would keep a hot entry alive past nothing —
-	// its expiry is absolute either way.
-	order *list.List
+// NewMemoryCache returns the in-memory cache this package uses by default,
+// bounded to maxEntries and reading time from now.
+//
+// It is exported so that a caller who wants the default behaviour with a
+// different bound, or who is composing it with something else — a local
+// cache in front of a shared one — does not have to write it again. Pass
+// nil for now to use [time.Now].
+func NewMemoryCache(maxEntries int, now func() time.Time) Cache {
+	if maxEntries < 1 {
+		maxEntries = DefaultCacheMaxEntries
+	}
+
+	if now == nil {
+		now = time.Now
+	}
+
+	return &memoryCache{
+		maxEntries: maxEntries,
+		now:        now,
+		entries:    make(map[string]*list.Element, maxEntries),
+		order:      list.New(),
+	}
 }
 
 type cacheEntry struct {
 	key string
 
-	// username is kept so that InvalidateUser can find the entries for
-	// one account without knowing the password that keyed them.
+	// username is kept so that InvalidateUser can find the entries for one
+	// account without knowing the password that keyed them.
 	username string
 
-	// principal is nil for a cached failure.
-	principal *Principal
+	// identity is nil for a cached rejection.
+	identity Identity
 
 	expiresAt time.Time
 }
 
-func newCache(maxEntries int, now func() time.Time) (*cache, error) {
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
-		return nil, err
-	}
-
-	return &cache{
-		secret:     secret,
-		maxEntries: maxEntries,
-		now:        now,
-		entries:    make(map[string]*list.Element, maxEntries),
-		order:      list.New(),
-	}, nil
-}
-
-// key derives the cache key. The username is included in the hashed input
-// as well as being stored alongside it, so that two accounts that happen
-// to share a password do not share an entry.
-func (c *cache) key(username, password string) string {
-	mac := hmac.New(sha256.New, c.secret)
-	mac.Write([]byte(username))
-	mac.Write([]byte{0})
-	mac.Write([]byte(password))
-
-	return string(mac.Sum(nil))
-}
-
-// lookup returns the cached outcome: a principal on a cached success, and
-// hit reporting whether anything was cached at all. A hit with a nil
-// principal is a cached failure.
-func (c *cache) lookup(username, password string) (p *Principal, hit bool) {
-	key := c.key(username, password)
-
+func (c *memoryCache) Get(_ context.Context, key string) (Identity, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	element, ok := c.entries[key]
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 
 	entry := element.Value.(*cacheEntry)
@@ -100,35 +139,36 @@ func (c *cache) lookup(username, password string) (p *Principal, hit bool) {
 	if !c.now().Before(entry.expiresAt) {
 		c.removeLocked(element)
 
-		return nil, false
+		return nil, false, nil
 	}
 
-	return entry.principal.clone(), true
+	if entry.identity == nil {
+		return nil, true, nil
+	}
+
+	return entry.identity.Clone(), true, nil
 }
 
-// store records an outcome. A nil principal records a failure. A
-// non-positive ttl records nothing, which is how negative caching is
-// switched off.
-func (c *cache) store(username, password string, p *Principal, ttl time.Duration) {
+func (c *memoryCache) Set(_ context.Context, key, username string, identity Identity, ttl time.Duration) error {
 	if ttl <= 0 {
-		return
+		return nil
 	}
-
-	key := c.key(username, password)
 
 	entry := &cacheEntry{
 		key:       key,
 		username:  username,
-		principal: p.clone(),
 		expiresAt: c.now().Add(ttl),
+	}
+
+	if identity != nil {
+		entry.identity = identity.Clone()
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if existing, ok := c.entries[key]; ok {
-		c.order.Remove(existing)
-		delete(c.entries, key)
+		c.removeLocked(existing)
 	}
 
 	c.entries[key] = c.order.PushBack(entry)
@@ -141,12 +181,15 @@ func (c *cache) store(username, password string, p *Principal, ttl time.Duration
 
 		c.removeLocked(oldest)
 	}
+
+	return nil
 }
 
-// invalidateUser drops every entry for one account, whatever password
-// keyed it. It is what an application calls when it has just changed
-// somebody's password and would rather not wait out the TTL.
-func (c *cache) invalidateUser(username string) int {
+// InvalidateUser drops every entry for one account. The username
+// comparison is case-insensitive, the way a directory would compare it:
+// erring towards dropping too much is correct here, and erring the other
+// way would leave a changed password working.
+func (c *memoryCache) InvalidateUser(_ context.Context, username string) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -155,7 +198,7 @@ func (c *cache) invalidateUser(username string) int {
 	for element := c.order.Front(); element != nil; {
 		next := element.Next()
 
-		if entryOf(element).matches(username) {
+		if strings.EqualFold(element.Value.(*cacheEntry).username, username) {
 			c.removeLocked(element)
 			dropped++
 		}
@@ -163,10 +206,10 @@ func (c *cache) invalidateUser(username string) int {
 		element = next
 	}
 
-	return dropped
+	return dropped, nil
 }
 
-func (c *cache) invalidateAll() int {
+func (c *memoryCache) InvalidateAll(context.Context) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -175,29 +218,18 @@ func (c *cache) invalidateAll() int {
 	c.entries = make(map[string]*list.Element, c.maxEntries)
 	c.order.Init()
 
-	return dropped
+	return dropped, nil
 }
 
-func (c *cache) size() int {
+func (c *memoryCache) Len(context.Context) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return len(c.entries)
+	return len(c.entries), nil
 }
 
 // removeLocked drops an element. The caller holds the lock.
-func (c *cache) removeLocked(element *list.Element) {
-	delete(c.entries, entryOf(element).key)
+func (c *memoryCache) removeLocked(element *list.Element) {
+	delete(c.entries, element.Value.(*cacheEntry).key)
 	c.order.Remove(element)
-}
-
-func entryOf(element *list.Element) *cacheEntry {
-	return element.Value.(*cacheEntry)
-}
-
-// matches compares usernames the way a directory would, case-insensitively.
-// Invalidation erring towards dropping too much is correct; erring towards
-// dropping too little would leave a changed password working.
-func (e *cacheEntry) matches(username string) bool {
-	return strings.EqualFold(e.username, username)
 }

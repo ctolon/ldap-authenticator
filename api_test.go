@@ -17,21 +17,30 @@ import (
 // deliberate change is a change to this file, and a change to this file is
 // a line in the changelog.
 type publicAPI struct {
-	New func(...ldapauth.Option) (*ldapauth.Authenticator, error)
+	New func(...ldapauth.Option) (*ldapauth.Client, error)
 
-	Authenticate func(*ldapauth.Authenticator, context.Context, string, string) (*ldapauth.Principal, error)
-	Lookup       func(*ldapauth.Authenticator, context.Context, string) (*ldapauth.Principal, error)
-	HealthCheck  func(*ldapauth.Authenticator, context.Context) error
-	Stats        func(*ldapauth.Authenticator) ldapauth.Stats
-	InvalidateU  func(*ldapauth.Authenticator, string) int
-	InvalidateA  func(*ldapauth.Authenticator) int
-	Close        func(*ldapauth.Authenticator) error
+	Authenticate func(*ldapauth.Client, context.Context, string, string) (ldapauth.Identity, error)
+	Lookup       func(*ldapauth.Client, context.Context, string) (ldapauth.Identity, error)
+	HealthCheck  func(*ldapauth.Client, context.Context) error
+	Stats        func(*ldapauth.Client, context.Context) ldapauth.Stats
+	InvalidateU  func(*ldapauth.Client, context.Context, string) (int, error)
+	InvalidateA  func(*ldapauth.Client, context.Context) (int, error)
+	Close        func(*ldapauth.Client) error
 
-	InGroup     func(*ldapauth.Principal, string) bool
-	InAnyGroup  func(*ldapauth.Principal, ...string) bool
-	InAllGroups func(*ldapauth.Principal, ...string) bool
-	Attribute   func(*ldapauth.Principal, string) string
-	AttrValues  func(*ldapauth.Principal, string) []string
+	GetDN          func(*ldapauth.Principal) string
+	GetUsername    func(*ldapauth.Principal) string
+	GetDisplayName func(*ldapauth.Principal) string
+	GetEmail       func(*ldapauth.Principal) string
+	GetGroups      func(*ldapauth.Principal) []string
+	GetAttribute   func(*ldapauth.Principal, string) string
+	GetAttrValues  func(*ldapauth.Principal, string) []string
+	InGroup        func(*ldapauth.Principal, string) bool
+	InAnyGroup     func(*ldapauth.Principal, ...string) bool
+	InAllGroups    func(*ldapauth.Principal, ...string) bool
+	Clone          func(*ldapauth.Principal) ldapauth.Identity
+
+	AsPrincipal    func(ldapauth.Identity) (*ldapauth.Principal, bool)
+	NewMemoryCache func(int, func() time.Time) ldapauth.Cache
 
 	ErrorMessage func(*ldapauth.AuthError) string
 	ErrorUnwrap  func(*ldapauth.AuthError) error
@@ -102,9 +111,16 @@ type publicAPI struct {
 	WithCache         func(time.Duration) ldapauth.Option
 	WithNegativeCache func(time.Duration) ldapauth.Option
 	WithCacheSize     func(int) ldapauth.Option
+	WithCacheStore    func(ldapauth.Cache) ldapauth.Option
+	WithCacheSecret   func([]byte) ldapauth.Option
+
+	// Pluggable behaviour.
+	WithPrincipalMapper func(ldapauth.PrincipalMapper) ldapauth.Option
+	WithGroupResolver   func(ldapauth.GroupResolver) ldapauth.Option
 
 	// Input handling.
 	WithUsernameMaxLength func(int) ldapauth.Option
+	WithPasswordMaxLength func(int) ldapauth.Option
 	WithCaseFoldUsername  func() ldapauth.Option
 	WithUsernameRedaction func() ldapauth.Option
 
@@ -120,19 +136,28 @@ func TestPublicAPIIsStable(t *testing.T) {
 	api := publicAPI{
 		New: ldapauth.New,
 
-		Authenticate: (*ldapauth.Authenticator).Authenticate,
-		Lookup:       (*ldapauth.Authenticator).Lookup,
-		HealthCheck:  (*ldapauth.Authenticator).HealthCheck,
-		Stats:        (*ldapauth.Authenticator).Stats,
-		InvalidateU:  (*ldapauth.Authenticator).InvalidateUser,
-		InvalidateA:  (*ldapauth.Authenticator).InvalidateAll,
-		Close:        (*ldapauth.Authenticator).Close,
+		Authenticate: (*ldapauth.Client).Authenticate,
+		Lookup:       (*ldapauth.Client).Lookup,
+		HealthCheck:  (*ldapauth.Client).HealthCheck,
+		Stats:        (*ldapauth.Client).Stats,
+		InvalidateU:  (*ldapauth.Client).InvalidateUser,
+		InvalidateA:  (*ldapauth.Client).InvalidateAll,
+		Close:        (*ldapauth.Client).Close,
 
-		InGroup:     (*ldapauth.Principal).InGroup,
-		InAnyGroup:  (*ldapauth.Principal).InAnyGroup,
-		InAllGroups: (*ldapauth.Principal).InAllGroups,
-		Attribute:   (*ldapauth.Principal).Attribute,
-		AttrValues:  (*ldapauth.Principal).AttributeValues,
+		GetDN:          (*ldapauth.Principal).GetDN,
+		GetUsername:    (*ldapauth.Principal).GetUsername,
+		GetDisplayName: (*ldapauth.Principal).GetDisplayName,
+		GetEmail:       (*ldapauth.Principal).GetEmail,
+		GetGroups:      (*ldapauth.Principal).GetGroups,
+		GetAttribute:   (*ldapauth.Principal).GetAttribute,
+		GetAttrValues:  (*ldapauth.Principal).GetAttributeValues,
+		InGroup:        (*ldapauth.Principal).InGroup,
+		InAnyGroup:     (*ldapauth.Principal).InAnyGroup,
+		InAllGroups:    (*ldapauth.Principal).InAllGroups,
+		Clone:          (*ldapauth.Principal).Clone,
+
+		AsPrincipal:    ldapauth.AsPrincipal,
+		NewMemoryCache: ldapauth.NewMemoryCache,
 
 		ErrorMessage: (*ldapauth.AuthError).Error,
 		ErrorUnwrap:  (*ldapauth.AuthError).Unwrap,
@@ -195,8 +220,14 @@ func TestPublicAPIIsStable(t *testing.T) {
 		WithCache:         ldapauth.WithCache,
 		WithNegativeCache: ldapauth.WithNegativeCache,
 		WithCacheSize:     ldapauth.WithCacheSize,
+		WithCacheStore:    ldapauth.WithCacheStore,
+		WithCacheSecret:   ldapauth.WithCacheSecret,
+
+		WithPrincipalMapper: ldapauth.WithPrincipalMapper,
+		WithGroupResolver:   ldapauth.WithGroupResolver,
 
 		WithUsernameMaxLength: ldapauth.WithUsernameMaxLength,
+		WithPasswordMaxLength: ldapauth.WithPasswordMaxLength,
 		WithCaseFoldUsername:  ldapauth.WithCaseFoldUsername,
 		WithUsernameRedaction: ldapauth.WithUsernameRedaction,
 
@@ -210,10 +241,25 @@ func TestPublicAPIIsStable(t *testing.T) {
 	}
 }
 
-// The interfaces callers implement, asserted here so that a change to one
-// of them is as loud as a change to a function signature.
+// The interfaces callers implement or receive, asserted here so that a
+// change to one of them is as loud as a change to a function signature.
 var (
-	_ ldapauth.Metrics = ldapauth.NoopMetrics{}
-	_ ldapauth.Dialer  = (ldapauth.Dialer)(nil)
-	_ ldapauth.Conn    = (ldapauth.Conn)(nil)
+	_ ldapauth.Metrics         = ldapauth.NoopMetrics{}
+	_ ldapauth.Identity        = (*ldapauth.Principal)(nil)
+	_ ldapauth.Authenticator   = (*ldapauth.Client)(nil)
+	_ ldapauth.GroupResolver   = ldapauth.NoGroups{}
+	_ ldapauth.Dialer          = (ldapauth.Dialer)(nil)
+	_ ldapauth.Conn            = (ldapauth.Conn)(nil)
+	_ ldapauth.Cache           = (ldapauth.Cache)(nil)
+	_ ldapauth.PrincipalMapper = (ldapauth.PrincipalMapper)(nil)
+	_ ldapauth.Searcher        = (ldapauth.Searcher)(nil)
+)
+
+// The func adapters, which exist so that a caller can supply behaviour
+// without declaring a type. If one of them stops satisfying its interface
+// the build breaks here rather than at a call site.
+var (
+	_ ldapauth.PrincipalMapper = ldapauth.PrincipalMapperFunc(nil)
+	_ ldapauth.GroupResolver   = ldapauth.GroupResolverFunc(nil)
+	_ ldapauth.Searcher        = ldapauth.SearcherFunc(nil)
 )

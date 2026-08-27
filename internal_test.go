@@ -9,8 +9,12 @@ package ldapauth
 
 import (
 	"errors"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-ldap/ldap/v3"
 )
@@ -233,5 +237,219 @@ func TestRetriableClassification(t *testing.T) {
 		if retriable(err) {
 			t.Errorf("retriable(%v) = true, want false", err)
 		}
+	}
+}
+
+func TestInflightCollapsesConcurrentCalls(t *testing.T) {
+	t.Parallel()
+
+	const callers = 16
+
+	f := newInflight()
+
+	var calls atomic.Int64
+
+	var wg sync.WaitGroup
+
+	shared := make(chan bool, callers)
+
+	for range callers {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			// The leader does not finish until every other caller has
+			// attached, so there is no window in which a straggler can
+			// arrive to find the flight already gone. No sleeping, and
+			// no timing assumption.
+			_, wasShared, err := f.do(t.Context(), "key", func() (Identity, error) {
+				calls.Add(1)
+
+				for f.waiting("key") < callers-1 {
+					runtime.Gosched()
+				}
+
+				return &Principal{DN: "uid=alice"}, nil
+			})
+			if err != nil {
+				t.Error(err)
+			}
+
+			shared <- wasShared
+		}()
+	}
+
+	wg.Wait()
+	close(shared)
+
+	if got := calls.Load(); got != 1 {
+		t.Errorf("the function ran %d times, want 1", got)
+	}
+
+	leaders := 0
+
+	for wasShared := range shared {
+		if !wasShared {
+			leaders++
+		}
+	}
+
+	if leaders != 1 {
+		t.Errorf("%d callers thought they were the leader, want 1", leaders)
+	}
+}
+
+func TestInflightGivesEveryWaiterItsOwnCopy(t *testing.T) {
+	t.Parallel()
+
+	f := newInflight()
+
+	var wg sync.WaitGroup
+
+	identities := make(chan Identity, 8)
+
+	for range 8 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			identity, _, err := f.do(t.Context(), "key", func() (Identity, error) {
+				for f.waiting("key") < 7 {
+					runtime.Gosched()
+				}
+
+				return &Principal{DN: "uid=alice", Groups: []string{"devs"}}, nil
+			})
+			if err != nil {
+				t.Error(err)
+
+				return
+			}
+
+			identities <- identity
+		}()
+	}
+
+	wg.Wait()
+	close(identities)
+
+	var first *Principal
+
+	for identity := range identities {
+		p := identity.(*Principal)
+
+		if first == nil {
+			first = p
+
+			continue
+		}
+
+		if p == first {
+			t.Fatal("two callers were handed the same *Principal")
+		}
+
+		p.Groups[0] = "tampered"
+
+		if first.Groups[0] == "tampered" {
+			t.Fatal("two callers share a groups slice")
+		}
+	}
+}
+
+func TestInflightPropagatesTheError(t *testing.T) {
+	t.Parallel()
+
+	f := newInflight()
+
+	sentinel := errors.New("the directory is down")
+
+	var wg sync.WaitGroup
+
+	for range 8 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			if _, _, err := f.do(t.Context(), "key", func() (Identity, error) {
+				for f.waiting("key") < 7 {
+					runtime.Gosched()
+				}
+
+				return nil, sentinel
+			}); !errors.Is(err, sentinel) {
+				t.Errorf("err = %v, want the sentinel", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestInflightReleasesWaitersWhenTheLeaderPanics(t *testing.T) {
+	t.Parallel()
+
+	// A leader that panics must not leave its waiters blocked on a
+	// channel nobody will close. The panic still reaches the leader's own
+	// caller, which is where it belongs.
+	f := newInflight()
+
+	release := make(chan struct{})
+	panicked := make(chan struct{})
+
+	go func() {
+		defer close(panicked)
+		defer func() { _ = recover() }()
+
+		_, _, _ = f.do(t.Context(), "key", func() (Identity, error) {
+			close(release)
+
+			panic("boom")
+		})
+	}()
+
+	<-release
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		// The waiter may arrive before or after the leader's deferred
+		// cleanup; either way it must not block forever.
+		_, _, _ = f.do(t.Context(), "key", func() (Identity, error) {
+			return &Principal{DN: "uid=alice"}, nil
+		})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a waiter blocked after the leader panicked")
+	}
+
+	<-panicked
+}
+
+func TestInflightForgetsFinishedCalls(t *testing.T) {
+	t.Parallel()
+
+	f := newInflight()
+
+	for range 4 {
+		if _, _, err := f.do(t.Context(), "key", func() (Identity, error) {
+			return &Principal{DN: "uid=alice"}, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if len(f.calls) != 0 {
+		t.Errorf("%d calls are still recorded, want 0 — this is how it leaks", len(f.calls))
 	}
 }

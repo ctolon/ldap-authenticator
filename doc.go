@@ -26,7 +26,7 @@
 //	}
 //	defer auth.Close()
 //
-//	principal, err := auth.Authenticate(ctx, username, password)
+//	identity, err := auth.Authenticate(ctx, username, password)
 //
 // The error tells you which of two things happened, and that is nearly all
 // the branching a caller needs:
@@ -36,6 +36,31 @@
 //	case errors.Is(err, ldapauth.ErrInvalidCredentials):   // 401
 //	default:                                               // 503
 //	}
+//
+// # The seams
+//
+// [New] returns a [*Client], which implements [Authenticator]. Everything
+// built on top of an authenticator should depend on that interface rather
+// than on the type, so that a test can substitute a fake and a deployment
+// can wrap the real one.
+//
+// [Client.Authenticate] returns an [Identity], and [Principal] is the
+// implementation this package produces. Most programs will never name the
+// interface: they take what they are given and read it. The programs that
+// do name it are the ones supplying their own user type through
+// [WithPrincipalMapper], and the reason the return is an interface at all.
+//
+// Five more interfaces exist for the same reason, each with a working
+// default, each replaceable one at a time:
+//
+//	Dialer           where connections come from       WithDialer
+//	Cache            where outcomes are remembered     WithCacheStore
+//	PrincipalMapper  what an authentication produces   WithPrincipalMapper
+//	GroupResolver    where groups come from            WithGroupResolver
+//	Metrics          where the numbers go              WithMetrics
+//
+// None of them has to be thought about to use this package, and none of
+// them costs a dependency.
 //
 // # The two strategies
 //
@@ -65,6 +90,7 @@
 //	  │
 //	  ├── reject empty username, empty password, control characters
 //	  ├── cache lookup (off by default)
+//	  ├── coalesce with any identical login already in flight
 //	  ├── retry loop (retriable failures only, never a rejected password)
 //	  │     │
 //	  │     ├── dial: URL list, failover, TLS or StartTLS
@@ -72,7 +98,7 @@
 //	  │     ├── read: attributes, over the pool or the user's connection
 //	  │     └── groups: memberOf, a group search, or the AD chain rule
 //	  │
-//	  └── Principal
+//	  └── Identity
 //
 // # Guarantees
 //
@@ -127,10 +153,31 @@
 // of this package re-authenticates the same credentials faster than the
 // directory can absorb — HTTP Basic auth on a chatty API being the usual
 // reason. What is cached is the outcome, keyed by a keyed hash of the
-// username and password under a per-process random key; no password and
-// nothing reversible into one is stored. What it costs is a window during
-// which a disabled account still works, and [MaxCacheTTL] caps that window
-// at five minutes.
+// username and password; no password and nothing reversible into one is
+// stored, and the [Cache] implementation never sees a credential. What it
+// costs is a window during which a disabled account still works, and
+// [MaxCacheTTL] caps that window at five minutes.
+//
+// With caching on, identical logins arriving at the same time are
+// collapsed into one round trip. The cache absorbs the second and later
+// attempts once the first has finished; coalescing is what closes the
+// window before that, which is the window a stampede actually lives in.
+//
+// # Several replicas
+//
+// Nothing here is shared between processes unless you share it. Each
+// replica has its own pool, its own failover state, and its own cache
+// secret — which means, by default, its own cache. To share one, give
+// every replica the same [WithCacheSecret] and a [WithCacheStore] that
+// points at the same place; without the shared secret the keys differ and
+// the shared cache silently never hits.
+//
+// Two things are worth knowing about running many of these at once. The
+// retry backoff is fully jittered, so a fleet that lost its directory at
+// the same instant does not come back at the same instant. And
+// [FailoverInOrder], the default, sends every replica to the same server
+// first — which is usually what you want, and is what [FailoverRandom]
+// exists to stop when it is not.
 //
 // # Testing
 //

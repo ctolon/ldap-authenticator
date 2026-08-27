@@ -3,6 +3,7 @@ package ldapauth
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/go-ldap/ldap/v3"
 )
@@ -49,6 +50,12 @@ var (
 	// Such a username cannot name a real directory entry; it can only be an
 	// attempt to reach something else.
 	ErrInvalidUsername = errors.New("ldapauth: invalid username")
+
+	// ErrInvalidPassword is returned when the password exceeds the
+	// configured maximum length. It is not "the password was wrong" —
+	// that is ErrInvalidCredentials — but "this cannot be a password",
+	// decided before anything reaches the wire.
+	ErrInvalidPassword = errors.New("ldapauth: invalid password")
 
 	// ErrInvalidCredentials reports that the directory rejected the bind.
 	// It is returned both when the user does not exist and when the
@@ -121,33 +128,34 @@ type AuthError struct {
 	Err error
 }
 
+// Error renders the failure as "ldapauth: <op> for <user> on <url>:
+// <result code>: <cause>", omitting whichever parts are not known.
 func (e *AuthError) Error() string {
-	var b []byte
+	var b strings.Builder
 
-	b = append(b, "ldapauth: "...)
-	b = append(b, e.Op...)
+	b.WriteString("ldapauth: ")
+	b.WriteString(e.Op)
 
 	if e.Username != "" {
-		b = append(b, " for "...)
-		b = append(b, e.Username...)
+		b.WriteString(" for ")
+		b.WriteString(e.Username)
 	}
 
 	if e.URL != "" {
-		b = append(b, " on "...)
-		b = append(b, e.URL...)
+		b.WriteString(" on ")
+		b.WriteString(e.URL)
 	}
 
 	if e.ResultCode != 0 {
-		b = append(b, ": "...)
-		b = append(b, fmt.Sprintf("%s (%d)", ldap.LDAPResultCodeMap[e.ResultCode], e.ResultCode)...)
+		fmt.Fprintf(&b, ": %s (%d)", ldap.LDAPResultCodeMap[e.ResultCode], e.ResultCode)
 	}
 
 	if e.Err != nil {
-		b = append(b, ": "...)
-		b = append(b, e.Err.Error()...)
+		b.WriteString(": ")
+		b.WriteString(e.Err.Error())
 	}
 
-	return string(b)
+	return b.String()
 }
 
 // Unwrap returns the wrapped cause so that errors.Is and errors.As reach

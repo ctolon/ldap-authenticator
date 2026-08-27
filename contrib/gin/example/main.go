@@ -41,10 +41,10 @@ func main() {
 
 	r := gin.Default()
 
-	r.POST("/login", ldapauthgin.LoginHandler(auth, func(c *gin.Context, p *ldapauth.Principal) {
+	r.POST("/login", ldapauthgin.LoginHandler(auth, func(c *gin.Context, identity ldapauth.Identity) {
 		// A real application would start a session here. What a session
 		// is remains its decision, not this library's.
-		c.JSON(http.StatusOK, gin.H{"dn": p.DN, "groups": p.Groups})
+		c.JSON(http.StatusOK, gin.H{"dn": identity.GetDN(), "groups": identity.GetGroups()})
 	}))
 
 	private := r.Group("/", ldapauthgin.BasicAuth(auth,
@@ -53,7 +53,7 @@ func main() {
 	))
 
 	private.GET("/me", func(c *gin.Context) {
-		c.JSON(http.StatusOK, ldapauthgin.MustPrincipal(c))
+		c.JSON(http.StatusOK, ldapauthgin.MustIdentity(c))
 	})
 
 	if err := r.Run(":8080"); err != nil {
