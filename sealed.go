@@ -74,8 +74,13 @@ const sealedCacheVersion = 1
 // serialises identities to JSON, authenticates them with HMAC-SHA-256,
 // and refuses anything whose seal does not verify.
 type sealedCache struct {
-	store  ByteStore
+	store ByteStore
+
+	// secret is the seal subkey, never the master: see derive.go for the
+	// forgery that sharing one key made possible.
 	secret []byte
+
+	now func() time.Time
 }
 
 // sealedEntry is the serialised form. A rejection is Identity == nil,
@@ -84,6 +89,18 @@ type sealedCache struct {
 type sealedEntry struct {
 	Version  int            `json:"v"`
 	Identity *wirePrincipal `json:"identity"`
+
+	// ExpiresAt is the entry's own expiry, in Unix nanoseconds, and it is
+	// inside the MAC.
+	//
+	// The store's TTL is not enough. HMAC proves who wrote a value, not
+	// when: a store that has been compromised, rolled back from a backup,
+	// or simply had its TTLs cleared can serve a genuinely sealed entry
+	// for as long as it likes, and a disabled account or a revoked group
+	// would keep working for anyone still using the same password. An
+	// expiry the store cannot edit turns that from indefinite into
+	// bounded by the TTL that was configured when the entry was written.
+	ExpiresAt int64 `json:"exp"`
 }
 
 // wirePrincipal is the on-the-wire shape of a [Principal].
@@ -138,10 +155,18 @@ func (w *wirePrincipal) principal() *Principal {
 // authenticator's own cache secret so the two cannot drift apart. Use
 // this directly only when composing caches by hand.
 //
-// The secret must be the same across every replica sharing the store,
-// and it must be the same one passed to [WithCacheSecret], or replicas
-// will reject each other's entries as tampered.
+// The secret must be the same across every replica sharing the store, and
+// it must be the same one passed to [WithCacheSecret], or replicas will
+// reject each other's entries as tampered.
+//
+// Pass the master secret, not a subkey of your own: this derives the seal
+// subkey from it, so the value given here and the value given to
+// [WithCacheSecret] are the same value.
 func NewSealedCache(store ByteStore, secret []byte) (Cache, error) {
+	return newSealedCache(store, secret, time.Now)
+}
+
+func newSealedCache(store ByteStore, secret []byte, now func() time.Time) (Cache, error) {
 	if store == nil {
 		return nil, fmt.Errorf("%w: NewSealedCache was given a nil store", ErrInvalidOption)
 	}
@@ -150,7 +175,19 @@ func NewSealedCache(store ByteStore, secret []byte) (Cache, error) {
 		return nil, fmt.Errorf("%w: NewSealedCache was given an empty secret", ErrInvalidOption)
 	}
 
-	return &sealedCache{store: store, secret: append([]byte(nil), secret...)}, nil
+	// The master is expanded here rather than taken as-is, so that a
+	// caller passing the same secret they gave WithCacheSecret gets the
+	// seal subkey and not the key-derivation one.
+	sealSecret, err := deriveSubkey(secret, cacheSealDomain)
+	if err != nil {
+		return nil, err
+	}
+
+	if now == nil {
+		now = time.Now
+	}
+
+	return &sealedCache{store: store, secret: sealSecret, now: now}, nil
 }
 
 // seal returns value prefixed by a MAC over the key and the value. The
@@ -158,12 +195,12 @@ func NewSealedCache(store ByteStore, secret []byte) (Cache, error) {
 // value that verifies under the key it was written to is the only thing
 // that verifies at all.
 func (c *sealedCache) seal(key string, value []byte) []byte {
-	mac := hmac.New(sha256.New, c.secret)
-	mac.Write([]byte(key))
-	mac.Write([]byte{0})
-	mac.Write(value)
-
-	return append(mac.Sum(make([]byte, 0, sha256.Size+len(value))), value...)
+	// No capacity hint. Sizing the result as sha256.Size+len(value) is
+	// arithmetic on a length that comes from outside, and on a 32-bit
+	// build a large enough value would wrap it negative and panic in
+	// make. append does the same single allocation with the runtime's
+	// checked arithmetic, which is worth more than the hint was.
+	return append(c.tag(key, value, nil), value...)
 }
 
 // open verifies a sealed value and returns the payload.
@@ -174,16 +211,28 @@ func (c *sealedCache) open(key string, sealed []byte) ([]byte, error) {
 
 	tag, value := sealed[:sha256.Size], sealed[sha256.Size:]
 
-	mac := hmac.New(sha256.New, c.secret)
-	mac.Write([]byte(key))
-	mac.Write([]byte{0})
-	mac.Write(value)
-
-	if !hmac.Equal(tag, mac.Sum(nil)) {
+	if !hmac.Equal(tag, c.tag(key, value, nil)) {
 		return nil, ErrCacheTampered
 	}
 
 	return value, nil
+}
+
+// tag appends the MAC over the key and the value to dst.
+//
+// The domain string is inside the MAC as well as inside the subkey. Either
+// would stop a tag from one purpose being read as a tag from another;
+// having both means a mistake in how the subkeys are wired cannot quietly
+// undo it.
+func (c *sealedCache) tag(key string, value, dst []byte) []byte {
+	mac := hmac.New(sha256.New, c.secret)
+	mac.Write([]byte(cacheSealDomain))
+	mac.Write([]byte{0})
+	mac.Write([]byte(key))
+	mac.Write([]byte{0})
+	mac.Write(value)
+
+	return mac.Sum(dst)
 }
 
 func (c *sealedCache) Get(ctx context.Context, key string) (Identity, bool, error) {
@@ -210,6 +259,14 @@ func (c *sealedCache) Get(ctx context.Context, key string) (Identity, bool, erro
 			entry.Version, sealedCacheVersion)
 	}
 
+	// Checked against this process's clock, not the store's word. A store
+	// that keeps an entry past its TTL — because it was rolled back,
+	// because its TTLs were cleared, or because somebody wanted it to —
+	// gets a miss rather than an authentication.
+	if entry.ExpiresAt != 0 && !c.now().Before(time.Unix(0, entry.ExpiresAt)) {
+		return nil, false, nil
+	}
+
 	if entry.Identity == nil {
 		return nil, true, nil
 	}
@@ -222,7 +279,10 @@ func (c *sealedCache) Set(ctx context.Context, key, username string, identity Id
 		return nil
 	}
 
-	entry := sealedEntry{Version: sealedCacheVersion}
+	entry := sealedEntry{
+		Version:   sealedCacheVersion,
+		ExpiresAt: c.now().Add(ttl).UnixNano(),
+	}
 
 	if identity != nil {
 		// Only *Principal is serialisable here. A custom Identity from

@@ -1078,6 +1078,13 @@ func WithCacheStore(store Cache) Option {
 // cache rather than corrupting it: every key changes, and any entry found
 // under an old key fails its seal and is treated as a miss.
 //
+// The secret is never used directly. Key derivation, sealing, and username
+// hashing each take their own HKDF subkey, because sharing one made the
+// login path a signing oracle for the seal — see derive.go and the
+// security notes. An entry also carries its own expiry inside the MAC, so
+// a store that ignores its TTL cannot replay an old identity: integrity
+// proves who wrote a value, not when.
+//
 // Caching must be turned on with [WithCache] as well.
 func WithSealedCacheStore(store ByteStore) Option {
 	return func(c *config) error {

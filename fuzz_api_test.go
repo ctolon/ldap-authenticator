@@ -1,7 +1,6 @@
 package ldapauth_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -259,20 +258,21 @@ func FuzzGroupFilterStaysOneTerm(f *testing.F) {
 
 // FuzzSealedCacheRejectsEverythingItDidNotWrite asserts the property the
 // whole sealed cache rests on: nothing verifies under a key unless this
-// package sealed exactly those bytes under exactly that key.
+// cache sealed exactly those bytes under exactly that key.
 //
-// The interesting inputs are the near misses — a valid entry with one bit
-// flipped, a valid entry under a neighbouring key, a tag with a valid
-// payload behind it — so the corpus is seeded with real sealed values and
-// the fuzzer is left to mutate them.
+// The seeds are real sealed values, so the fuzzer mutates well-formed
+// input rather than noise — a valid entry with a bit flipped, a valid
+// entry under a neighbouring key, a valid tag in front of a different
+// payload. They are sealed under one secret and read back under another,
+// which makes the invariant absolute: the cache under test wrote none of
+// these bytes, so a hit of any kind is a failure and there is no
+// legitimate case to carve out.
 func FuzzSealedCacheRejectsEverythingItDidNotWrite(f *testing.F) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
-
-	// Build the seeds once. Sealing inside the fuzz function would spend
-	// most of the budget on HMAC rather than on mutation.
+	// Sealing inside the fuzz function would spend the budget on HMAC
+	// rather than on mutation, so the seeds are built once.
 	seeds := newByteStore()
 
-	sealed, err := ldapauth.NewSealedCache(seeds, secret)
+	sealed, err := ldapauth.NewSealedCache(seeds, []byte("0123456789abcdef0123456789abcdef"))
 	if err != nil {
 		f.Fatalf("NewSealedCache: %v", err)
 	}
@@ -303,47 +303,21 @@ func FuzzSealedCacheRejectsEverythingItDidNotWrite(f *testing.F) {
 
 	store := newByteStore()
 
-	subject, err := ldapauth.NewSealedCache(store, secret)
+	subject, err := ldapauth.NewSealedCache(store, []byte("fedcba9876543210fedcba9876543210"))
 	if err != nil {
 		f.Fatalf("NewSealedCache: %v", err)
 	}
 
 	f.Fuzz(func(t *testing.T, key string, value []byte) {
-		// What the fuzzer produced is by construction not something this
-		// cache wrote — its store is empty and only ever holds what the
-		// test puts there. So the only acceptable outcome is a miss.
 		store.put(key, value)
 
 		// The error is deliberately ignored: a value that fails its seal
-		// or its decode reports one, and the assertion here is only that
-		// it did not become a hit.
+		// or its decode reports one, and the assertion is only that it
+		// did not become a hit.
 		identity, hit, _ := subject.Get(ctx, key)
-		if !hit {
-			return
-		}
-
-		// A hit is only legitimate if the fuzzer happened to reproduce a
-		// value this secret would have produced for this key, which means
-		// re-sealing it must give back the same bytes.
-		roundTrip := newByteStore()
-
-		writer, err := ldapauth.NewSealedCache(roundTrip, secret)
-		if err != nil {
-			t.Fatalf("NewSealedCache: %v", err)
-		}
-
-		if err := writer.Set(ctx, key, "alice", identity, time.Minute); err != nil {
-			t.Fatalf("re-sealing what verified: %v", err)
-		}
-
-		expected, _, err := roundTrip.Get(ctx, key)
-		if err != nil {
-			t.Fatalf("reading the re-sealed value: %v", err)
-		}
-
-		if !bytes.Equal(expected, value) {
-			t.Fatalf("a value verified that this secret would not have written for %q:\n got %x\nwant %x",
-				key, value, expected)
+		if hit {
+			t.Fatalf("a value this cache never wrote verified under %q: identity=%v value=%x",
+				key, identity, value)
 		}
 	})
 }

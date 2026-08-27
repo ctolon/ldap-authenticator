@@ -119,11 +119,18 @@ func TestNoPasswordEverReachesAnError(t *testing.T) {
 
 	// Every error path a caller can reach, including the ones that carry
 	// a wrapped protocol error up from go-ldap.
+	//
+	// The over-length case is here because it is the one a scanner points
+	// at: its message is built from the submitted password, and CodeQL
+	// reports the flow. What it actually interpolates is len(password)
+	// and the configured bound, both integers — which is a thing to
+	// assert rather than to argue about in a comment.
 	attempts := []struct{ username, password string }{
 		{"alice", password + "-wrong"},
 		{"alice", ""},
 		{"nobody", password},
 		{"*)(uid=*", password},
+		{"alice", strings.Repeat(password, 200)},
 	}
 
 	for _, attempt := range attempts {

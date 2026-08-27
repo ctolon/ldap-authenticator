@@ -73,9 +73,14 @@ type Client struct {
 	// cache is nil unless WithCache or WithCacheStore was given.
 	cache Cache
 
-	// cacheSecret keys the HMAC that turns a credential into a cache key,
-	// so that no Cache implementation ever sees one.
-	cacheSecret []byte
+	// cacheKeySecret keys the HMAC that turns a credential into a cache
+	// key. It is a subkey of what the caller supplied, bound to that one
+	// purpose; see derive.go for why the purposes must not share a key.
+	cacheKeySecret []byte
+
+	// cacheNameSecret keys the username hash under
+	// WithCacheUsernameHashing, as its own subkey.
+	cacheNameSecret []byte
 
 	// flights collapses concurrent authentications of the same credential.
 	// It is nil when there is no cache, because without one every request
@@ -230,14 +235,26 @@ func (a *Client) initCache(cfg *config) error {
 		secret = generated
 	}
 
-	a.cacheSecret = secret
+	// Every purpose gets its own subkey. Sharing one made the login path
+	// a signing oracle for the seal; derive.go has the detail.
+	keySecret, err := deriveSubkey(secret, cacheKeyDomain)
+	if err != nil {
+		return err
+	}
+
+	nameSecret, err := deriveSubkey(secret, cacheUsernameDomain)
+	if err != nil {
+		return err
+	}
+
+	a.cacheKeySecret, a.cacheNameSecret = keySecret, nameSecret
 
 	switch {
 	case cfg.sealedStore != nil:
 		// Built here rather than by the caller so the seal and the key
 		// derivation cannot end up under different secrets — the one
 		// mistake that would make a shared cache silently never hit.
-		sealed, err := NewSealedCache(cfg.sealedStore, secret)
+		sealed, err := newSealedCache(cfg.sealedStore, secret, cfg.now)
 		if err != nil {
 			return err
 		}
@@ -767,7 +784,9 @@ func (a *Client) withTimeout(ctx context.Context) (context.Context, context.Canc
 // alongside it, so that two accounts which happen to share a password do
 // not share an entry.
 func (a *Client) cacheKey(username, password string) string {
-	mac := hmac.New(sha256.New, a.cacheSecret)
+	mac := hmac.New(sha256.New, a.cacheKeySecret)
+	mac.Write([]byte(cacheKeyDomain))
+	mac.Write([]byte{0})
 	mac.Write([]byte(a.cacheName(username)))
 	mac.Write([]byte{0})
 	mac.Write([]byte(password))
@@ -903,8 +922,9 @@ func (a *Client) storedUsername(username string) string {
 		return folded
 	}
 
-	mac := hmac.New(sha256.New, a.cacheSecret)
-	mac.Write([]byte("username\x00"))
+	mac := hmac.New(sha256.New, a.cacheNameSecret)
+	mac.Write([]byte(cacheUsernameDomain))
+	mac.Write([]byte{0})
 	mac.Write([]byte(folded))
 
 	return hex.EncodeToString(mac.Sum(nil))

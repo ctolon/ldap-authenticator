@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+**A shared sealed cache could be forged through the key derivation.**
+`WithSealedCacheStore`, added in 1.2.0, sealed cache values with
+HMAC-SHA-256 so that a store nobody trusts could not decide who somebody
+is. It derived the cache key with the same construction under the same
+secret:
+
+```text
+key = HMAC(secret, username ‖ 0 ‖ password)
+tag = HMAC(secret, key      ‖ 0 ‖ value)
+```
+
+With no domain separation between them, the login endpoint was a signing
+oracle for the seal. An attacker able to read and write the shared store —
+the threat the feature was built for — read a victim's cache key `K`,
+prepared a forged identity `V`, and submitted a login with username `K` and
+password `V`. The login failed, the negative cache wrote an entry, and that
+entry's key was `hex(HMAC(secret, K ‖ 0 ‖ V))`: the seal tag for `V` under
+`K`. Writing `tag‖V` back under `K` forged an identity with arbitrary
+groups, which is the authorisation bypass the seal was supposed to prevent.
+
+The three uses of the cache secret now take separate HKDF-SHA-256 subkeys
+(`ldapauth/cache-key/v1`, `ldapauth/cache-seal/v1`,
+`ldapauth/cache-username/v1`), and each MAC input additionally carries its
+own domain string. Either measure closes the attack; both are applied.
+`TestTheSealCannotBeForgedThroughTheKeyDerivation` runs it end to end and
+fails against 1.2.0.
+
+**Anyone using `WithSealedCacheStore` on 1.2.0 should upgrade.** The rest of
+the package is unaffected: the derivation was only reachable through that
+option, and a deployment using the in-memory cache or `WithCacheStore` was
+never exposed to it. Every cache key changes, so a shared cache is cold
+once after upgrading and a mixed fleet misses rather than misreads.
+
+**A sealed entry now carries its own expiry.** The payload had no signed
+expiry, so freshness rested entirely on the store's TTL — and a store that
+has been rolled back, had its TTLs cleared, or been taken over has no
+reason to honour it. A genuinely sealed entry from when an account was an
+administrator could be replayed indefinitely, outliving a disabled account
+or a revoked group for anyone still using the same password. The expiry is
+now inside the MAC and checked against the authenticating process's clock.
+
+### Fixed
+
+- The sealed cache sized its output buffer as `sha256.Size + len(value)`,
+  arithmetic on a length that comes from outside the process. It cannot
+  wrap on a 64-bit build, and on a 32-bit one a large enough value would
+  make the capacity negative and panic in `make`. The hint is gone;
+  `append` performs the same single allocation under the runtime's checked
+  arithmetic.
+
+### Documentation
+
+- `SECURITY.md` gains a section answering the two findings an automated
+  scan reliably reports against this repository: `GO-2026-5932`
+  (`golang.org/x/crypto/openpgp` is unmaintained), which is not in the
+  build graph — `go-ldap` pulls `golang.org/x/crypto` only for `md4`, and
+  `govulncheck` confirms nothing reachable — and CodeQL's
+  `go/clear-text-logging`, which fires on the `passwordMaxLength` `int`
+  because the identifier matches `password`.
+- `TestNoPasswordEverReachesAnError` now covers the over-length path that
+  finding points at, so the claim is asserted rather than argued.
+
 ## [1.2.0] - 2026-08-27
 
 A review of 1.1 found a resource leak reachable by any server that accepts

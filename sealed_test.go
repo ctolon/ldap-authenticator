@@ -2,6 +2,8 @@ package ldapauth_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -393,5 +395,143 @@ func TestTheTwoCacheStoreOptionsAreExclusive(t *testing.T) {
 
 	if !errors.Is(err, ldapauth.ErrInvalidOption) {
 		t.Errorf("err = %v, want ErrInvalidOption", err)
+	}
+}
+
+func TestATagIsNotValidOutsideItsPurpose(t *testing.T) {
+	t.Parallel()
+
+	// The unit-level statement of what derive.go is for: the same master
+	// secret, the same two strings, and the login path's key derivation
+	// still does not produce something the seal will accept.
+	store := newByteStore()
+
+	auth := searchAuth(t, newDirectory(),
+		ldapauth.WithCache(time.Minute),
+		ldapauth.WithCacheSecret(sealedSecret),
+		ldapauth.WithSealedCacheStore(store),
+	)
+
+	ctx := testContext(t)
+
+	if _, err := auth.Authenticate(ctx, "alice", alicePassword); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	keys := store.keys()
+	if len(keys) != 1 {
+		t.Fatalf("the store holds %d entries, want one", len(keys))
+	}
+
+	value, _, err := store.Get(ctx, keys[0])
+	if err != nil {
+		t.Fatalf("reading the entry: %v", err)
+	}
+
+	// The seal tag is the first 32 bytes. If the two derivations shared a
+	// key and a message shape, this hex would be a cache key the login
+	// path could also have produced — that is the whole attack.
+	tag := hex.EncodeToString(value[:sha256.Size])
+
+	if tag == keys[0] {
+		t.Fatal("the seal tag equals the cache key: the two derivations have collapsed into one")
+	}
+}
+
+// TestTheSealCannotBeForgedThroughTheKeyDerivation is the regression test
+// for a cross-protocol forgery against WithSealedCacheStore.
+//
+// The cache key and the seal tag were both HMAC-SHA-256 under the same
+// secret over the same shape — A, a NUL, then B:
+//
+//	key  = HMAC(secret, username ‖ 0 ‖ password)
+//	tag  = HMAC(secret, key      ‖ 0 ‖ value)
+//
+// With no domain separation between them, the login path is a signing
+// oracle for the seal. An attacker who can read and write the shared store
+// submits a login whose username is the victim's cache key and whose
+// password is the forged payload; the login fails, the negative cache
+// writes an entry, and the key of that entry is hex(HMAC(secret, K ‖ 0 ‖
+// V)) — which is exactly the seal tag for that payload under that key.
+// Decoding it and writing tag‖value back under K forges an identity.
+//
+// The store here is honest. What is under test is whether the package
+// hands out a tag for bytes it never sealed.
+func TestTheSealCannotBeForgedThroughTheKeyDerivation(t *testing.T) {
+	t.Parallel()
+
+	store := newByteStore()
+
+	auth := searchAuth(t, newDirectory(),
+		ldapauth.WithCache(time.Minute),
+		ldapauth.WithCacheSecret(sealedSecret),
+		ldapauth.WithSealedCacheStore(store),
+	)
+
+	ctx := testContext(t)
+
+	// The victim logs in, so the store holds one entry under their key.
+	if _, err := auth.Authenticate(ctx, "alice", alicePassword); err != nil {
+		t.Fatalf("the victim's login: %v", err)
+	}
+
+	keys := store.keys()
+	if len(keys) != 1 {
+		t.Fatalf("the store holds %d entries, want the victim's one", len(keys))
+	}
+
+	victimKey := keys[0]
+
+	// The payload the attacker wants believed, in the exact serialised
+	// form the sealed cache reads back.
+	forgedValue, err := json.Marshal(map[string]any{
+		"v": 1,
+		"identity": map[string]any{
+			"dn":       "uid=alice,ou=people,dc=corp,dc=example",
+			"username": "alice",
+			"groups":   []string{"domain admins"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("building the payload: %v", err)
+	}
+
+	// The oracle: a login whose username is the victim's key and whose
+	// password is the payload. It fails, and the negative cache writes an
+	// entry keyed by the MAC of exactly those two strings.
+	if _, err := auth.Authenticate(ctx, victimKey, string(forgedValue)); err == nil {
+		t.Fatal("the oracle login succeeded, which this test did not arrange")
+	}
+
+	var oracleKey string
+
+	for _, key := range store.keys() {
+		if key != victimKey {
+			oracleKey = key
+
+			break
+		}
+	}
+
+	if oracleKey == "" {
+		t.Skip("no negative-cache entry was written; the oracle does not exist on this path")
+	}
+
+	tag, err := hex.DecodeString(oracleKey)
+	if err != nil {
+		t.Fatalf("the cache key is not hex: %v", err)
+	}
+
+	// If the two derivations share a domain, this is a valid seal.
+	store.put(victimKey, append(tag, forgedValue...))
+
+	identity, err := auth.Authenticate(ctx, "alice", alicePassword)
+	if err != nil {
+		t.Fatalf("the victim's second login: %v", err)
+	}
+
+	if identity.InGroup("domain admins") {
+		t.Fatal("FORGED: the login path signed a cache value it never sealed, " +
+			"and the sealed cache accepted it")
 	}
 }

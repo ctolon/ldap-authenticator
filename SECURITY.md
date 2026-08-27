@@ -44,6 +44,54 @@ that line; there are no backports to older 1.x patches.
   network call, as is a username that is empty, overlong, not valid UTF-8,
   or carrying a control character.
 
+## Scanner findings that do not affect this module
+
+Two things reliably show up in an automated scan of this repository and are
+worth answering here, so that nobody has to re-derive the answer.
+
+**`GO-2026-5932` — `golang.org/x/crypto/openpgp` is unmaintained.** The
+advisory names `golang.org/x/crypto` with no fixed version, so a scanner
+that works from the module graph alone reports it against anything that
+requires that module. This module does require it, transitively:
+`go-ldap/ldap/v3` imports `golang.org/x/crypto/md4` for NTLM binds, which
+is the only package of it that reaches the build.
+
+None of the `openpgp` packages the advisory names is in the build graph —
+`go list -deps ./...` finds none of them — and `govulncheck`, which
+resolves reachability rather than module edges, reports the module and then
+says the code does not call it:
+
+```
+Your code is affected by 0 vulnerabilities.
+This scan also found 0 vulnerabilities in packages you import and 1
+vulnerability in modules you require, but your code doesn't appear to call
+these vulnerabilities.
+```
+
+`make check` runs `govulncheck` on every commit, so a change that made a
+vulnerability reachable would fail the gate rather than reach a release.
+
+**`go/clear-text-logging` in the examples.** CodeQL treats an identifier
+matching `password` as a source of sensitive data. The `passwordMaxLength`
+configuration field matches, and it is an `int` — a length bound, not a
+credential. It reaches an error string in two places, and both carry
+integers only:
+
+```
+ldapauth: invalid option: password max length 0 is below 1
+ldapauth: invalid password: 6000 bytes exceeds the 1024 byte limit
+```
+
+Those errors are returned to the caller, and the example programs print
+them, which is what the query sees. The property that matters is tested
+directly rather than argued: `TestNoPasswordEverReachesALogRecord` runs a
+full authentication with distinctive passwords and searches everything the
+package logged, and `TestNoPasswordEverReachesAnError` does the same across
+every error path a caller can reach, the over-length one included.
+
+If you are evaluating this library and either finding gave you pause, those
+two tests are the thing to read.
+
 ## What it does not promise
 
 It does not make an insecure directory secure. It cannot tell you whether

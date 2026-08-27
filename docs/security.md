@@ -278,6 +278,57 @@ able to decide who somebody is.
 
 Nothing produces `ErrCacheTampered` by accident. Alert on it.
 
+#### The seal and the key derivation must not share a secret
+
+They did in 1.2.0, and it was exploitable. Both were HMAC-SHA-256 under the
+cache secret over the same shape — one string, a NUL, then another:
+
+```text
+key = HMAC(secret, username ‖ 0 ‖ password)
+tag = HMAC(secret, key      ‖ 0 ‖ value)
+```
+
+which made the login endpoint a signing oracle for the seal. An attacker
+who could read and write the shared store — the threat the seal exists for
+— read a victim's cache key `K`, prepared a forged value `V`, and submitted
+a login with username `K` and password `V`. The login failed, the negative
+cache (on by default) wrote an entry, and the key of that entry was
+`hex(HMAC(secret, K ‖ 0 ‖ V))` — the seal tag for `V` under `K`. Decoding
+it and writing `tag‖V` back under `K` forged an identity with any groups
+they liked.
+
+Since 1.2.1 the three uses of the cache secret take separate HKDF-derived
+subkeys, and each MAC input carries its own domain string:
+
+```text
+ldapauth/cache-key/v1
+ldapauth/cache-seal/v1
+ldapauth/cache-username/v1
+```
+
+Either measure alone closes it; both are applied so that a mistake in how
+the subkeys are wired cannot quietly undo the separation.
+`TestTheSealCannotBeForgedThroughTheKeyDerivation` runs the attack end to
+end, and `FuzzSealedCacheRejectsEverythingItDidNotWrite` reads arbitrary
+bytes back under a different secret than sealed them.
+
+The derivation change means every cache key changes: a shared cache is cold
+once after upgrading, and a mixed fleet of 1.2.0 and 1.2.1 replicas simply
+misses rather than misreads.
+
+#### Integrity is not freshness
+
+A seal proves who wrote a value, not when. The store's TTL is the store's
+business, and a store that has been rolled back from a backup, had its TTLs
+cleared, or been taken over has no reason to honour it — so a genuinely
+sealed entry from when somebody was an administrator could be served
+indefinitely.
+
+The expiry is therefore inside the sealed payload and covered by the MAC,
+and it is checked against the authenticating process's own clock. An entry
+past it is a miss. That bounds a compromised store to replaying entries for
+the TTL that was configured when they were written, rather than forever.
+
 Two things a sealed cache does not carry, both deliberate:
 
 - **`Principal.Extra`.** It holds a value of your type; JSON hands it back

@@ -8,6 +8,7 @@ package ldapauth
 // asking the same question with more that can go wrong in between.
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"strings"
@@ -451,5 +452,138 @@ func TestInflightForgetsFinishedCalls(t *testing.T) {
 
 	if len(f.calls) != 0 {
 		t.Errorf("%d calls are still recorded, want 0 — this is how it leaks", len(f.calls))
+	}
+}
+
+// memByteStore is a minimal ByteStore for the in-package tests. It does
+// not expire anything on its own: the point of the tests using it is that
+// the sealed cache must not depend on a store that does.
+type memByteStore struct {
+	mu      sync.Mutex
+	entries map[string][]byte
+}
+
+func newMemByteStore() *memByteStore {
+	return &memByteStore{entries: map[string][]byte{}}
+}
+
+func (s *memByteStore) Get(_ context.Context, key string) ([]byte, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	value, ok := s.entries[key]
+
+	return value, ok, nil
+}
+
+func (s *memByteStore) Set(_ context.Context, key, _ string, value []byte, _ time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.entries[key] = value
+
+	return nil
+}
+
+func (s *memByteStore) InvalidateUser(context.Context, string) (int, error) { return 0, nil }
+func (s *memByteStore) InvalidateAll(context.Context) (int, error)          { return 0, nil }
+
+func (s *memByteStore) Len(context.Context) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return len(s.entries), nil
+}
+
+// stepClock is a clock a test moves by hand, so that expiry is asserted
+// rather than slept through.
+type stepClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *stepClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.now
+}
+
+func (c *stepClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.now = c.now.Add(d)
+}
+
+func TestASealedEntryExpiresOnItsOwnTerms(t *testing.T) {
+	t.Parallel()
+
+	// The store's TTL is the store's business, and a store that has been
+	// compromised or rolled back from a backup has no reason to honour
+	// it. HMAC proves who wrote a value, not when — so the expiry lives
+	// inside the seal, and is checked against this process's clock.
+	//
+	// Without it, an entry that was genuinely sealed when somebody was an
+	// administrator keeps saying so for as long as the store serves it.
+	store := newMemByteStore()
+	clock := &stepClock{now: time.Unix(1_700_000_000, 0)}
+	ctx := context.Background()
+
+	sealed, err := newSealedCache(store, []byte("0123456789abcdef0123456789abcdef"), clock.Now)
+	if err != nil {
+		t.Fatalf("newSealedCache: %v", err)
+	}
+
+	admin := &Principal{DN: "uid=root,dc=corp", Groups: []string{"admins"}}
+	if err := sealed.Set(ctx, "key", "root", admin, time.Minute); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	clock.advance(30 * time.Second)
+
+	if _, hit, err := sealed.Get(ctx, "key"); !hit || err != nil {
+		t.Fatalf("a live entry did not come back: hit=%v err=%v", hit, err)
+	}
+
+	clock.advance(31 * time.Second)
+
+	// The bytes are still there and still verify. Only the clock moved.
+	if _, held, _ := store.Get(ctx, "key"); !held {
+		t.Fatal("the store dropped the entry, so this proves nothing")
+	}
+
+	if _, hit, err := sealed.Get(ctx, "key"); hit {
+		t.Error("an expired entry was served; a store that ignores its TTL decides who somebody is")
+	} else if err != nil {
+		t.Errorf("an expired entry should be a plain miss, got %v", err)
+	}
+}
+
+func TestTheCacheSubkeysDiffer(t *testing.T) {
+	t.Parallel()
+
+	// The property derive.go exists for, stated at the bottom: one master
+	// secret, three purposes, three different keys. Sharing one made the
+	// login path a signing oracle for the seal.
+	master := []byte("0123456789abcdef0123456789abcdef")
+
+	seen := map[string]string{}
+
+	for _, domain := range []string{cacheKeyDomain, cacheSealDomain, cacheUsernameDomain} {
+		subkey, err := deriveSubkey(master, domain)
+		if err != nil {
+			t.Fatalf("deriveSubkey(%s): %v", domain, err)
+		}
+
+		if string(subkey) == string(master) {
+			t.Errorf("%s: the subkey is the master secret", domain)
+		}
+
+		if previous, clash := seen[string(subkey)]; clash {
+			t.Errorf("%s and %s derive the same subkey", domain, previous)
+		}
+
+		seen[string(subkey)] = domain
 	}
 }
