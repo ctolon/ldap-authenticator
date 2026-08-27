@@ -1,0 +1,48 @@
+# The directory the integration suite runs against.
+#
+#   make integration
+#
+# It is plaintext on purpose: TLS here would test the container's
+# certificate handling rather than this library's, and the library's own
+# TLS configuration is exercised by unit tests that need no server. The
+# suite passes WithInsecureNoTLS, which is what that option is for.
+#
+# The image creates dc=example,dc=com and the admin account itself from
+# LDAP_DOMAIN; ldifs/ adds the tree the tests expect on top of that, which
+# is why it does not define the base entry.
+services:
+  openldap:
+    image: osixia/openldap:1.5.0
+    command: ["--copy-service", "--loglevel", "warning"]
+    environment:
+      LDAP_ORGANISATION: Example
+      LDAP_DOMAIN: example.com
+      LDAP_ADMIN_PASSWORD: admin-password
+      LDAP_CONFIG_PASSWORD: config-password
+    volumes:
+      - ./ldifs:/container/service/slapd/assets/config/bootstrap/ldif/custom:ro
+      - ./config:/config:ro
+    ports:
+      - "1389:389"
+    # The probe binds as the admin account rather than anonymously: the
+    # image's default ACLs hide the tree from anonymous readers, so an
+    # anonymous probe reports "no such object" for a directory that is
+    # perfectly healthy.
+    healthcheck:
+      test:
+        - CMD
+        - ldapsearch
+        - -x
+        - -H
+        - ldap://localhost:389
+        - -D
+        - cn=admin,dc=example,dc=com
+        - -w
+        - admin-password
+        - -b
+        - uid=alice,ou=people,dc=example,dc=com
+        - -s
+        - base
+      interval: 2s
+      timeout: 5s
+      retries: 45

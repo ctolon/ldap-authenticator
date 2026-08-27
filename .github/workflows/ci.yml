@@ -1,0 +1,146 @@
+# The gate. Every job here has a `make` target behind it, so that a green
+# `make check` on a laptop means a green CI and there is no second, hidden
+# definition of "passing".
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.25', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: go test ./...
+
+  race:
+    name: race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: make test-race
+
+  vet:
+    name: vet, format, lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: make fmt-check
+      - run: make vet
+      - run: make staticcheck
+      # A go.mod that tidy would change is a go.mod that does not describe
+      # the build, and the dependency guard is only as good as the file it
+      # reads.
+      - name: go mod tidy is a no-op
+        run: |
+          make tidy
+          git diff --exit-code -- '**/go.mod' '**/go.sum' go.mod go.sum
+
+  deps-guard:
+    name: one dependency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # The claim on the front of the README, enforced rather than trusted.
+      - run: make deps-guard
+
+  contrib:
+    name: contrib modules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: make contrib
+
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: make fuzz-smoke FUZZTIME=60s
+      # A crasher is the most valuable artefact a CI run can produce.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: testdata/fuzz/
+
+  bench:
+    name: benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: make bench BENCHTIME=100ms
+
+  examples:
+    name: examples build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: make examples
+
+  integration:
+    name: integration (OpenLDAP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: ./scripts/integration.sh --down
+      - if: failure()
+        run: docker compose -f integration/compose.yml logs
+
+  # One stable check name for branch protection, so that adding a job above
+  # does not mean editing the branch rules.
+  ci-green:
+    name: ci-green
+    runs-on: ubuntu-latest
+    needs: [test, race, vet, deps-guard, contrib, fuzz, bench, examples, integration]
+    if: always()
+    steps:
+      - name: fail if anything above failed
+        run: |
+          if ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}; then
+            echo "a required job did not pass"
+            exit 1
+          fi

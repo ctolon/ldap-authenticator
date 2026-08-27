@@ -1,0 +1,17 @@
+# Build and test output
+/dist/
+*.test
+*.out
+*.prof
+
+# Fuzzing corpora that reproduce a failure are not ignored. A crasher
+# committed alongside the fix is what stops the same input from coming
+# back, and it is the only artefact that proves the fix was tested against
+# the thing it fixes.
+!testdata/fuzz/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store

@@ -1,0 +1,44 @@
+name: Feature request
+description: Something this package should do and does not.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This package has one direct dependency and intends to keep it, and
+        it deliberately does not issue sessions, write to the directory, or
+        wrap a web framework. A request that needs any of those is not
+        necessarily a no, but it needs an argument.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what stops you. Not the solution yet.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: An option, a method, a change in behaviour. A sketch of the API helps.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you are doing instead
+      description: If there is a workaround, it tells us how much this is worth.
+
+  - type: dropdown
+    id: dependency
+    attributes:
+      label: Would this need a new dependency?
+      options:
+        - "No"
+        - "Yes, in the root module"
+        - "Yes, but it could live in a contrib module"
+    validations:
+      required: true

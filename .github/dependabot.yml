@@ -1,0 +1,38 @@
+# Every module gets its own entry: Dependabot does not discover nested
+# modules on its own, and the whole point of the contrib modules is that
+# they hold dependencies the root module refuses.
+#
+# The analysis tools pinned in the Makefile are deliberately not here.
+# They are raised by hand, because an unattended bump of staticcheck can
+# turn main red without a single change to this repository.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: gomod
+    directory: /contrib/gin
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: gomod
+    directory: /contrib/echo
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: gomod
+    directory: /contrib/fiber
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

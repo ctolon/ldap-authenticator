@@ -1,0 +1,77 @@
+# The checks that are worth running on a schedule rather than on a push:
+# vulnerability scanning, and fuzzing for long enough to find something a
+# 60-second smoke run would not.
+name: Security
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: make vuln
+
+  deep-fuzz:
+    name: deep fuzz
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: make fuzz-smoke FUZZTIME=10m
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: testdata/fuzz/
+
+  soak:
+    name: pool and failover soak
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # The integration suite under the race detector, repeated, against a
+      # real directory: the shape of failure that only shows up after the
+      # pool has churned for a while.
+      - run: ./scripts/integration.sh -count=20
+      - if: always()
+        run: docker compose -f integration/compose.yml down --volumes
+
+  security-green:
+    name: security-green
+    runs-on: ubuntu-latest
+    needs: [govulncheck, deep-fuzz, soak]
+    if: always()
+    steps:
+      - name: fail if anything above failed
+        run: |
+          if ${{ contains(needs.*.result, 'failure') }}; then
+            echo "a required job did not pass"
+            exit 1
+          fi

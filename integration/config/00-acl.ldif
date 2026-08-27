@@ -1,0 +1,15 @@
+# The image ships an ACL that lets an identity read its own entry and
+# nothing else, so the service account cannot see the user tree and every
+# search comes back as "no such object". That is a sensible default for a
+# container and a useless one for this suite.
+#
+# What replaces it is what the documentation recommends for a real
+# deployment: a service account with read access to the tree and no more.
+# It cannot write, and it cannot read userPassword — this library verifies
+# a password by binding, never by reading or comparing one.
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+replace: olcAccess
+olcAccess: {0}to * by dn.exact=gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth manage by * break
+olcAccess: {1}to attrs=userPassword,shadowLastChange by self write by dn="cn=admin,dc=example,dc=com" write by anonymous auth by * none
+olcAccess: {2}to * by self read by dn="cn=admin,dc=example,dc=com" write by dn="cn=readonly,dc=example,dc=com" read by * none
