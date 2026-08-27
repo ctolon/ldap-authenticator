@@ -7,7 +7,85 @@ import (
 	"github.com/go-ldap/ldap/v3"
 )
 
-// resolveGroups produces the group list for an authenticated principal.
+// A Searcher runs a search against the directory on the authenticator's
+// behalf.
+//
+// It is what a [GroupResolver] is handed instead of a connection: the
+// authenticator decides which identity the search runs as — the pooled
+// service account where there is one, the user's own connection otherwise
+// — applies the configured paging, and keeps the connection's lifetime to
+// itself. A resolver cannot bind, cannot write, and cannot hold the
+// connection past the call it was given.
+type Searcher interface {
+	// Search runs one search and returns its result. The context bounds
+	// the call, and the request must not be retained or mutated
+	// afterwards.
+	Search(ctx context.Context, request *ldap.SearchRequest) (*ldap.SearchResult, error)
+}
+
+// SearcherFunc adapts a function to [Searcher].
+type SearcherFunc func(ctx context.Context, request *ldap.SearchRequest) (*ldap.SearchResult, error)
+
+// Search calls f.
+func (f SearcherFunc) Search(ctx context.Context, request *ldap.SearchRequest) (*ldap.SearchResult, error) {
+	return f(ctx, request)
+}
+
+// GroupRequest is what a [GroupResolver] is asked about.
+type GroupRequest struct {
+	// Username is the username as supplied to Authenticate.
+	Username string
+
+	// DN is the distinguished name that was authenticated.
+	DN string
+
+	// Entry is the user's directory entry, or nil when the configuration
+	// read none. The resolver must not retain it.
+	Entry *ldap.Entry
+
+	// Search runs searches against the directory. It is valid only for the
+	// duration of the call.
+	Search Searcher
+}
+
+// A GroupResolver produces the groups an authenticated identity belongs
+// to.
+//
+// The default resolves them from the directory, in whichever of the three
+// ways the configuration asked for. Replace it when membership lives
+// somewhere the directory is not — an entitlements service, a mapping
+// table, a static list for a break-glass account — or when your directory
+// has a group scheme this package does not model.
+//
+// It runs inside the caller's context and inside the retry loop, so it
+// should be quick and it must not have side effects that would be wrong to
+// repeat. An error it returns fails the authentication.
+type GroupResolver interface {
+	// ResolveGroups returns the groups the request's identity belongs to,
+	// as names or as DNs — whichever the rest of the application expects.
+	// Returning an empty slice and a nil error means "no groups", which
+	// is a legitimate answer; returning an error fails the
+	// authentication.
+	ResolveGroups(ctx context.Context, request GroupRequest) ([]string, error)
+}
+
+// GroupResolverFunc adapts a function to [GroupResolver].
+type GroupResolverFunc func(ctx context.Context, request GroupRequest) ([]string, error)
+
+// ResolveGroups calls f.
+func (f GroupResolverFunc) ResolveGroups(ctx context.Context, request GroupRequest) ([]string, error) {
+	return f(ctx, request)
+}
+
+// NoGroups is a [GroupResolver] that resolves nothing. It is what the
+// package uses when group resolution is disabled, and it is a useful base
+// for a resolver that only sometimes has an answer.
+type NoGroups struct{}
+
+// ResolveGroups returns no groups and no error.
+func (NoGroups) ResolveGroups(context.Context, GroupRequest) ([]string, error) { return nil, nil }
+
+// directoryGroups is the [GroupResolver] this package implements.
 //
 // Which of the three shapes runs is a configuration decision, and the
 // trade-off between them is round trips against directory support:
@@ -21,43 +99,62 @@ import (
 // are not rare — a directory will happily let two groups contain each
 // other — and either bound alone would be enough, which is why there are
 // two.
-func (a *Authenticator) resolveGroups(ctx context.Context, r *resolved, username string) ([]string, error) {
-	switch a.cfg.groupSource {
-	case GroupsDisabled:
-		return nil, nil
+type directoryGroups struct {
+	cfg *config
 
+	// names memoises group DN to group name for the duration of one
+	// request, and is allocated on first use — only a nested memberOf
+	// walk ever reads a group's entry, and only that walk has anything to
+	// remember. It belongs to the request rather than to the resolver: a
+	// process-wide map of every group DN ever seen would be a cache
+	// nobody asked for, with no bound and no invalidation.
+	names map[string]string
+}
+
+func (g *directoryGroups) ResolveGroups(ctx context.Context, request GroupRequest) ([]string, error) {
+	switch g.cfg.groupSource {
 	case GroupsFromMemberOf:
-		return a.groupsFromMemberOf(ctx, r)
+		return g.perRequest().fromMemberOf(ctx, request)
 
 	case GroupsFromSearch:
-		return a.groupsFromSearch(ctx, r, username)
+		return g.perRequest().fromSearch(ctx, request)
 
 	default:
 		return nil, nil
 	}
 }
 
-// groupsFromMemberOf reads the memberships off the user's own entry.
-func (a *Authenticator) groupsFromMemberOf(ctx context.Context, r *resolved) ([]string, error) {
-	if r.entry == nil {
+// perRequest returns a copy to hold the request's own state.
+//
+// The resolver stored on the Client is shared by every goroutine, so
+// nothing may be written to it. Group resolution is off by default, so
+// this allocates nothing at all in the common case: the copy is made only
+// once there is a group source to run.
+func (g *directoryGroups) perRequest() *directoryGroups {
+	return &directoryGroups{cfg: g.cfg}
+}
+
+// fromMemberOf reads the memberships off the user's own entry.
+func (g *directoryGroups) fromMemberOf(ctx context.Context, request GroupRequest) ([]string, error) {
+	if request.Entry == nil {
 		return nil, nil
 	}
 
-	dns := r.entry.GetAttributeValues(a.cfg.memberOfAttribute)
+	dns := request.Entry.GetAttributeValues(g.cfg.memberOfAttribute)
 
-	if !a.cfg.nestedGroups || a.cfg.activeDirectoryChain {
-		return a.namesFor(r, dns)
+	if !g.cfg.nestedGroups || g.cfg.activeDirectoryChain {
+		return g.labelsFor(dns), nil
 	}
 
 	// Walk upwards: each group is itself an entry that may carry its own
-	// memberOf. One lookup per group per level, which is why the AD
-	// matching rule is worth using where it is available.
+	// memberOf. One lookup per group per level, which is why the Active
+	// Directory matching rule is worth using where it is available.
 	seen := make(map[string]struct{}, len(dns)*2)
 	ordered := make([]string, 0, len(dns)*2)
 
 	frontier := dns
 
-	for depth := 0; depth < a.cfg.nestedGroupDepth && len(frontier) > 0; depth++ {
+	for depth := 0; depth < g.cfg.nestedGroupDepth && len(frontier) > 0; depth++ {
 		var next []string
 
 		for _, dn := range frontier {
@@ -70,80 +167,64 @@ func (a *Authenticator) groupsFromMemberOf(ctx context.Context, r *resolved) ([]
 			seen[key] = struct{}{}
 			ordered = append(ordered, dn)
 
-			parents, err := a.parentsOf(ctx, r, dn)
-			if err != nil {
-				return nil, err
-			}
-
-			next = append(next, parents...)
+			next = append(next, g.parentsOf(ctx, request, dn)...)
 		}
 
 		frontier = next
 	}
 
-	return a.namesFor(r, ordered)
+	return g.labelsFor(ordered), nil
 }
 
 // parentsOf reads one group's own memberOf attribute.
-func (a *Authenticator) parentsOf(ctx context.Context, r *resolved, dn string) ([]string, error) {
-	entry, err := a.onConn(ctx, r, func(conn Conn) (*ldap.Entry, error) {
-		request := ldap.NewSearchRequest(
-			dn,
-			ScopeBaseObject,
-			a.cfg.userDerefAliases,
-			1,
-			a.searchTimeLimit(),
-			false,
-			"(objectClass=*)",
-			[]string{a.cfg.memberOfAttribute, a.cfg.groupNameAttribute},
-			nil,
-		)
-
-		result, serr := a.search(conn, request)
-		if serr != nil {
-			return nil, serr
-		}
-
-		if len(result.Entries) == 0 {
-			return nil, nil
-		}
-
-		return result.Entries[0], nil
-	})
+func (g *directoryGroups) parentsOf(ctx context.Context, request GroupRequest, dn string) []string {
+	result, err := request.Search.Search(ctx, ldap.NewSearchRequest(
+		dn,
+		ldap.ScopeBaseObject,
+		g.cfg.userDerefAliases,
+		1,
+		g.cfg.searchTimeLimit(),
+		false,
+		"(objectClass=*)",
+		[]string{g.cfg.memberOfAttribute, g.cfg.groupNameAttribute},
+		nil,
+	))
 	if err != nil {
 		// A group that cannot be read is a hole in the answer, not a
 		// failed login. Nested expansion is best-effort by nature: the
 		// directory may simply not let this identity read the group tree,
 		// and refusing the authentication over it would be a worse
 		// outcome than reporting the memberships that could be read.
+		//
 		// Worth a warning rather than a debug line: the login succeeded
 		// and the group list it carries is incomplete, which is exactly
 		// the kind of failure that shows up later as a mysterious
 		// authorisation denial.
-		a.warn("nested group lookup failed; the group list may be incomplete",
+		g.cfg.logger.Warn("nested group lookup failed; the group list may be incomplete",
 			"group", dn, "error", err)
 
-		return nil, nil
+		return nil
 	}
 
-	if entry == nil {
-		return nil, nil
+	if len(result.Entries) == 0 {
+		return nil
 	}
 
-	r.rememberGroupName(a.cfg.groupNameAttribute, entry)
+	entry := result.Entries[0]
+	g.remember(entry)
 
-	return entry.GetAttributeValues(a.cfg.memberOfAttribute), nil
+	return entry.GetAttributeValues(g.cfg.memberOfAttribute)
 }
 
-// groupsFromSearch searches the group tree for entries naming the user.
-func (a *Authenticator) groupsFromSearch(ctx context.Context, r *resolved, username string) ([]string, error) {
+// fromSearch searches the group tree for entries naming the user.
+func (g *directoryGroups) fromSearch(ctx context.Context, request GroupRequest) ([]string, error) {
 	seen := make(map[string]struct{}, 8)
 	out := make([]string, 0, 8)
 
-	frontier := []string{r.dn}
+	frontier := []string{request.DN}
 
-	depth := a.cfg.nestedGroupDepth
-	if !a.cfg.nestedGroups || a.cfg.activeDirectoryChain {
+	depth := g.cfg.nestedGroupDepth
+	if !g.cfg.nestedGroups || g.cfg.activeDirectoryChain {
 		depth = 1
 	}
 
@@ -151,7 +232,7 @@ func (a *Authenticator) groupsFromSearch(ctx context.Context, r *resolved, usern
 		var next []string
 
 		for _, memberDN := range frontier {
-			entries, err := a.searchGroups(ctx, r, memberDN, username)
+			entries, err := g.searchGroups(ctx, request, memberDN)
 			if err != nil {
 				return nil, err
 			}
@@ -164,7 +245,7 @@ func (a *Authenticator) groupsFromSearch(ctx context.Context, r *resolved, usern
 				}
 
 				seen[key] = struct{}{}
-				out = append(out, a.groupLabel(entry))
+				out = append(out, g.label(entry))
 				next = append(next, entry.DN)
 			}
 		}
@@ -175,105 +256,88 @@ func (a *Authenticator) groupsFromSearch(ctx context.Context, r *resolved, usern
 	return out, nil
 }
 
-func (a *Authenticator) searchGroups(ctx context.Context, r *resolved, memberDN, username string) ([]*ldap.Entry, error) {
-	filter := a.cfg.groupFilter.expandFilter(map[string]string{
+func (g *directoryGroups) searchGroups(ctx context.Context, request GroupRequest, memberDN string) ([]*ldap.Entry, error) {
+	filter := g.cfg.groupFilter.expandFilter(map[string]string{
 		placeholderUserDN:   memberDN,
-		placeholderUsername: username,
-		placeholderBaseDN:   a.cfg.groupBaseDN,
+		placeholderUsername: request.Username,
+		placeholderBaseDN:   g.cfg.groupBaseDN,
 	})
 
-	request := ldap.NewSearchRequest(
-		a.cfg.groupBaseDN,
-		a.cfg.groupScope,
-		a.cfg.userDerefAliases,
+	result, err := request.Search.Search(ctx, ldap.NewSearchRequest(
+		g.cfg.groupBaseDN,
+		g.cfg.groupScope,
+		g.cfg.userDerefAliases,
 		0,
-		a.searchTimeLimit(),
+		g.cfg.searchTimeLimit(),
 		false,
 		filter,
-		[]string{a.cfg.groupNameAttribute},
+		[]string{g.cfg.groupNameAttribute},
 		nil,
-	)
-
-	var entries []*ldap.Entry
-
-	_, err := a.onConn(ctx, r, func(conn Conn) (*ldap.Entry, error) {
-		result, serr := a.search(conn, request)
-		if serr != nil {
-			return nil, serr
-		}
-
-		entries = result.Entries
-
-		return nil, nil
-	})
+	))
 	if err != nil {
 		return nil, &AuthError{
 			Op:         "group search",
-			Username:   a.cfg.safeUsername(username),
+			Username:   g.cfg.safeUsername(request.Username),
 			ResultCode: resultCode(err),
 			Err:        err,
 		}
 	}
 
-	return entries, nil
+	return result.Entries, nil
 }
 
-// namesFor turns group DNs into whatever Principal.Groups should hold.
-func (a *Authenticator) namesFor(r *resolved, dns []string) ([]string, error) {
+// labelsFor turns group DNs into whatever the group list should hold.
+func (g *directoryGroups) labelsFor(dns []string) []string {
 	out := make([]string, 0, len(dns))
 
 	for _, dn := range dns {
-		if a.cfg.groupsAsDN {
+		switch {
+		case g.cfg.groupsAsDN:
 			out = append(out, dn)
 
-			continue
+		default:
+			if name, ok := g.names[strings.ToLower(dn)]; ok {
+				out = append(out, name)
+
+				continue
+			}
+
+			out = append(out, rdnValue(dn, g.cfg.groupNameAttribute))
 		}
-
-		if name, ok := r.groupNames[strings.ToLower(dn)]; ok {
-			out = append(out, name)
-
-			continue
-		}
-
-		out = append(out, rdnValue(dn, a.cfg.groupNameAttribute))
 	}
 
-	return out, nil
+	return out
 }
 
-// groupLabel is the label for a group entry: its DN, or the configured
-// name attribute, falling back to the DN's first RDN when the directory
-// did not return the attribute.
-func (a *Authenticator) groupLabel(entry *ldap.Entry) string {
-	if a.cfg.groupsAsDN {
+// label is the label for a group entry: its DN, or the configured name
+// attribute, falling back to the DN's first RDN when the directory did not
+// return the attribute.
+func (g *directoryGroups) label(entry *ldap.Entry) string {
+	if g.cfg.groupsAsDN {
 		return entry.DN
 	}
 
-	if name := entry.GetAttributeValue(a.cfg.groupNameAttribute); name != "" {
+	if name := entry.GetAttributeValue(g.cfg.groupNameAttribute); name != "" {
 		return name
 	}
 
-	return rdnValue(entry.DN, a.cfg.groupNameAttribute)
+	return rdnValue(entry.DN, g.cfg.groupNameAttribute)
 }
 
-// rememberGroupName notes a DN-to-name mapping seen during a nested walk,
-// so that the memberOf path can report the real attribute value rather than
-// a parsed RDN for the groups it happened to read.
-//
-// The memo lives on the request, not on the authenticator. A process-wide
-// map of every group DN ever seen would be a cache nobody asked for, with
-// no bound and no invalidation.
-func (r *resolved) rememberGroupName(attribute string, entry *ldap.Entry) {
-	name := entry.GetAttributeValue(attribute)
+// remember notes a DN-to-name mapping seen during a nested walk, so that
+// the memberOf path can report the real attribute value rather than a
+// parsed RDN for the groups it happened to read.
+func (g *directoryGroups) remember(entry *ldap.Entry) {
+	name := entry.GetAttributeValue(g.cfg.groupNameAttribute)
 	if name == "" || entry.DN == "" {
 		return
 	}
 
-	if r.groupNames == nil {
-		r.groupNames = make(map[string]string, 8)
+	if g.names == nil {
+		g.names = make(map[string]string, 8)
 	}
 
-	r.groupNames[strings.ToLower(entry.DN)] = name
+	g.names[strings.ToLower(entry.DN)] = name
 }
 
 // rdnValue extracts a name from a DN without a round trip.
@@ -301,22 +365,34 @@ func rdnValue(dn, wantType string) string {
 	return first.Value
 }
 
-// onConn runs fn on the best connection available: the service-account
-// pool when there is one, and otherwise the user's own connection.
+// searcherFor builds the [Searcher] a group resolver is handed.
 //
-// The fallback is what lets a direct-bind deployment resolve groups with
-// no privileged account at all. It has a real consequence, and it is the
-// one worth knowing: the group search then runs with the user's own read
-// permissions, so a directory that hides the group tree from ordinary
-// users returns an empty group list rather than an error.
-func (a *Authenticator) onConn(ctx context.Context, r *resolved, fn func(Conn) (*ldap.Entry, error)) (*ldap.Entry, error) {
-	if a.pool != nil {
-		return a.withPooledConn(ctx, fn)
-	}
+// It uses the service-account pool when there is one, and otherwise the
+// user's own connection. The fallback is what lets a direct-bind
+// deployment resolve groups with no privileged account at all. It has a
+// real consequence, and it is the one worth knowing: the group search then
+// runs with the user's own read permissions, so a directory that hides the
+// group tree from ordinary users returns an empty group list rather than
+// an error.
+func (a *Client) searcherFor(r *resolved) Searcher {
+	return SearcherFunc(func(ctx context.Context, request *ldap.SearchRequest) (*ldap.SearchResult, error) {
+		if a.pool != nil {
+			var result *ldap.SearchResult
 
-	if r.conn == nil {
-		return nil, ErrClosed
-	}
+			_, err := a.withPooledConn(ctx, func(conn Conn) (*ldap.Entry, error) {
+				var serr error
+				result, serr = a.search(conn, request)
 
-	return fn(r.conn)
+				return nil, serr
+			})
+
+			return result, err
+		}
+
+		if r == nil || r.conn == nil {
+			return nil, ErrClosed
+		}
+
+		return a.search(r.conn, request)
+	})
 }

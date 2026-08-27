@@ -62,12 +62,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	principal, err := auth.Authenticate(ctx, *username, password)
+	identity, err := auth.Authenticate(ctx, *username, password)
 
 	switch {
 	case err == nil:
 		fmt.Printf("authenticated\n  dn:    %s\n  name:  %s\n  email: %s\n",
-			principal.DN, principal.DisplayName, principal.Email)
+			identity.GetDN(), identity.GetDisplayName(), identity.GetEmail())
 
 	case errors.Is(err, ldapauth.ErrInvalidCredentials):
 		fmt.Fprintln(os.Stderr, "rejected")

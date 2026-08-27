@@ -72,7 +72,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	principal, err := auth.Authenticate(ctx, *username, *password)
+	identity, err := auth.Authenticate(ctx, *username, *password)
 	if err != nil {
 		if errors.Is(err, ldapauth.ErrInvalidCredentials) {
 			fmt.Fprintln(os.Stderr, "rejected")
@@ -83,6 +83,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("authenticated %s (%s)\n", principal.DN, principal.Email)
-	fmt.Printf("pool: %+v\n", auth.Stats())
+	fmt.Printf("authenticated %s (%s)\n", identity.GetDN(), identity.GetEmail())
+	fmt.Printf("pool: %+v\n", auth.Stats(ctx))
 }

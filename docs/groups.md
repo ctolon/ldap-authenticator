@@ -106,7 +106,7 @@ differently.
 In the application:
 
 ```go
-if !principal.InAnyGroup("developers", "ops") {
+if !identity.InAnyGroup("developers", "ops") {
     return errForbidden
 }
 ```
@@ -128,3 +128,9 @@ not reject anybody.
 A group requirement with no group source configured rejects everybody,
 because the principal arrives with no groups. That is a configuration
 mistake worth watching for.
+
+## When the directory is not where groups live
+
+`WithGroupResolver` replaces all of the above with your own code, and hands
+it a `Searcher` so it can still ask the directory when it wants to. See
+[extending.md](extending.md).

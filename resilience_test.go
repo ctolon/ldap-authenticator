@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -176,8 +177,8 @@ func TestFailoverSkipsADeadServer(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if p.DN != aliceDN {
-		t.Errorf("DN = %q, want %q", p.DN, aliceDN)
+	if p.GetDN() != aliceDN {
+		t.Errorf("DN = %q, want %q", p.GetDN(), aliceDN)
 	}
 
 	for _, bind := range dir.Binds() {
@@ -256,7 +257,7 @@ func TestStatsReportFailoverHealth(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	stats := auth.Stats()
+	stats := auth.Stats(testContext(t))
 
 	if stats.Servers != 2 {
 		t.Errorf("Servers = %d, want 2", stats.Servers)
@@ -374,8 +375,8 @@ func TestConcurrentAuthenticationIsSafe(t *testing.T) {
 				return
 			}
 
-			if p.Username != username {
-				errs <- fmt.Errorf("got principal for %q while authenticating %q", p.Username, username)
+			if p.GetUsername() != username {
+				errs <- fmt.Errorf("got principal for %q while authenticating %q", p.GetUsername(), username)
 			}
 		}(i)
 	}
@@ -418,4 +419,402 @@ func (d countingDialer) DialContext(ctx context.Context, url string) (ldapauth.C
 	d.calls.Add(1)
 
 	return d.inner.DialContext(ctx, url)
+}
+
+func TestEverythingAtOnceUnderRace(t *testing.T) {
+	t.Parallel()
+
+	// A deliberate pile-up: every entry point, every background moving
+	// part, and a shutdown underneath all of it. Nothing here asserts an
+	// outcome — the assertions are the race detector's, and the only
+	// failure this test can report on its own is a deadlock or a panic.
+	dir := newDirectory()
+
+	clock := newClock()
+
+	auth := searchAuth(t, dir,
+		ldapauth.WithClock(clock.Now),
+		ldapauth.WithMemberOfGroups(),
+		ldapauth.WithNestedGroups(),
+		ldapauth.WithEmailAttribute("mail"),
+		ldapauth.WithCache(time.Minute),
+		ldapauth.WithNegativeCache(30*time.Second),
+		ldapauth.WithPoolSize(4),
+		ldapauth.WithPoolMinIdle(2),
+		ldapauth.WithPoolMaxLifetime(time.Minute),
+		ldapauth.WithPoolMaxIdleTime(30*time.Second),
+		ldapauth.WithRetryBackoff(time.Millisecond, 2*time.Millisecond, 2),
+	)
+
+	ctx := testContext(t)
+
+	stop := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	worker := func(fn func(i int)) {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+
+				fn(i)
+			}
+		}()
+	}
+
+	// Successful logins, rejected logins, lookups, health checks, stats,
+	// invalidation, a clock that keeps moving so the pool and the cache
+	// keep expiring, and a server that comes and goes.
+	worker(func(int) { _, _ = auth.Authenticate(ctx, "alice", alicePassword) })
+	worker(func(int) { _, _ = auth.Authenticate(ctx, "bob", bobPassword) })
+	worker(func(int) { _, _ = auth.Authenticate(ctx, "alice", "wrong") })
+	worker(func(int) { _, _ = auth.Lookup(ctx, "alice") })
+	worker(func(int) { _ = auth.HealthCheck(ctx) })
+	worker(func(int) { _ = auth.Stats(ctx) })
+	worker(func(int) { _, _ = auth.InvalidateUser(ctx, "alice") })
+	worker(func(int) { clock.Advance(5 * time.Second) })
+	worker(func(i int) { dir.SetDown(memoryURL, i%8 == 0) })
+
+	time.Sleep(250 * time.Millisecond)
+
+	// Close while everything is still running: the whole point is that
+	// shutdown races with in-flight work rather than waiting politely for
+	// a quiet moment.
+	if err := auth.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	close(stop)
+	wg.Wait()
+}
+
+func TestCloseIsSafeFromManyGoroutines(t *testing.T) {
+	t.Parallel()
+
+	auth := searchAuth(t, newDirectory())
+
+	var wg sync.WaitGroup
+
+	for range 16 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			if err := auth.Close(); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if _, err := auth.Authenticate(testContext(t), "alice", alicePassword); !errors.Is(err, ldapauth.ErrClosed) {
+		t.Errorf("err = %v, want ErrClosed", err)
+	}
+}
+
+func TestPoolReturnsEveryConnectionItTookOut(t *testing.T) {
+	t.Parallel()
+
+	// A pool that leaked slots would deadlock rather than fail, and it
+	// would do it under load rather than in a unit test. This is the
+	// cheap version of that: exhaust the pool repeatedly, through both
+	// the success and the failure paths, and require it to still be
+	// empty at the end.
+	var fail atomic.Bool
+
+	dir := newDirectory()
+	dir.SearchHook = func(*ldap.SearchRequest) error {
+		if fail.Load() {
+			return ldap.NewError(ldap.ErrorNetwork, errors.New("connection reset"))
+		}
+
+		return nil
+	}
+
+	auth := searchAuth(t, dir,
+		ldapauth.WithPoolSize(2),
+		ldapauth.WithPoolHealthCheck(false),
+		ldapauth.WithoutRetry(),
+	)
+
+	var wg sync.WaitGroup
+
+	for i := range 40 {
+		wg.Add(1)
+
+		go func(i int) {
+			defer wg.Done()
+
+			fail.Store(i%3 == 0)
+
+			_, _ = auth.Authenticate(testContext(t), "alice", alicePassword)
+		}(i)
+	}
+
+	wg.Wait()
+
+	fail.Store(false)
+
+	stats := auth.Stats(testContext(t))
+	if stats.PoolInUse != 0 {
+		t.Errorf("PoolInUse = %d after everything finished, want 0", stats.PoolInUse)
+	}
+
+	// And the pool still works, which is the part a leak would break.
+	if _, err := auth.Authenticate(testContext(t), "alice", alicePassword); err != nil {
+		t.Fatalf("Authenticate after the churn: %v", err)
+	}
+}
+
+func TestPasswordLengthIsBounded(t *testing.T) {
+	t.Parallel()
+
+	dir := newDirectory()
+	auth := searchAuth(t, dir, ldapauth.WithPasswordMaxLength(32))
+
+	_, err := auth.Authenticate(testContext(t), "alice", strings.Repeat("x", 33))
+	if !errors.Is(err, ldapauth.ErrInvalidPassword) {
+		t.Fatalf("err = %v, want ErrInvalidPassword", err)
+	}
+
+	if binds := len(dir.Binds()); binds != 0 {
+		t.Errorf("binds = %d, want 0: an oversized password costs no round trip", binds)
+	}
+}
+
+func TestIdleConnectionsAreReaped(t *testing.T) {
+	t.Parallel()
+
+	// The janitor is the only thing that closes an idle connection when
+	// no traffic is arriving to notice it has aged out. Its tick is real
+	// time — the expiry decision is not, which is what the clock is for.
+	clock := newClock()
+	dir := newDirectory()
+
+	auth := searchAuth(t, dir,
+		ldapauth.WithClock(clock.Now),
+		ldapauth.WithPoolMaxIdleTime(4*time.Second),
+		ldapauth.WithPoolHealthCheck(false),
+	)
+
+	if _, err := auth.Authenticate(testContext(t), "alice", alicePassword); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	if idle := auth.Stats(testContext(t)).PoolIdle; idle != 1 {
+		t.Fatalf("PoolIdle = %d after one login, want 1", idle)
+	}
+
+	clock.Advance(time.Minute)
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for auth.Stats(testContext(t)).PoolIdle > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the janitor never reaped the idle connection")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestPagingReachesTheWire(t *testing.T) {
+	t.Parallel()
+
+	// Active Directory truncates an unpaged search at 1000 entries and
+	// says nothing about it, so a group search over a large directory
+	// that is not paged is a group list that is quietly wrong.
+	dir := newDirectory()
+
+	auth := searchAuth(t, dir,
+		ldapauth.WithPagingSize(500),
+		ldapauth.WithGroupSearch(groupsDN, "(member={{user_dn}})"),
+	)
+
+	if _, err := auth.Authenticate(testContext(t), "alice", alicePassword); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	if paged := dir.PagedSearches(); paged == 0 {
+		t.Error("WithPagingSize was configured but no search was paged")
+	}
+}
+
+func TestDirectBindReadsThroughTheServiceAccountWhenThereIsOne(t *testing.T) {
+	t.Parallel()
+
+	// A directory may let a user bind while not letting them read their
+	// own attributes, so a service account, where one is configured, is
+	// the right identity for the lookup that follows a direct bind.
+	dir := newDirectory()
+
+	auth := newAuthenticator(t, dir,
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+		ldapauth.WithServiceAccount(serviceDN, servicePassword),
+		ldapauth.WithEmailAttribute("mail"),
+		ldapauth.WithMemberOfGroups(),
+	)
+
+	identity, err := auth.Authenticate(testContext(t), "alice", alicePassword)
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	if identity.GetEmail() != "alice@example.com" {
+		t.Errorf("Email = %q, want it read", identity.GetEmail())
+	}
+
+	serviceBinds := 0
+
+	for _, bind := range dir.Binds() {
+		if bind.DN == serviceDN {
+			serviceBinds++
+		}
+	}
+
+	if serviceBinds == 0 {
+		t.Error("the service account was configured but never bound")
+	}
+}
+
+func TestAnUnreadableEntryStillAuthenticates(t *testing.T) {
+	t.Parallel()
+
+	// The bind succeeded, so the entry exists. Not being able to read it
+	// is a directory permission to fix, not an authentication to fail.
+	dir := newDirectory()
+	dir.SearchHook = func(request *ldap.SearchRequest) error {
+		if request.BaseDN == aliceDN {
+			// A directory that hides the entry answers a base search
+			// with no entries rather than with an error.
+			request.Filter = "(objectClass=nothing-matches-this)"
+		}
+
+		return nil
+	}
+
+	auth := directAuth(t, dir, ldapauth.WithEmailAttribute("mail"))
+
+	identity, err := auth.Authenticate(testContext(t), "alice", alicePassword)
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	if identity.GetDN() != aliceDN {
+		t.Errorf("DN = %q, want the bound DN", identity.GetDN())
+	}
+
+	if identity.GetEmail() != "" {
+		t.Errorf("Email = %q, want empty when the entry could not be read", identity.GetEmail())
+	}
+}
+
+func TestBackoffStopsWhenTheCallerGivesUp(t *testing.T) {
+	t.Parallel()
+
+	dir := newDirectory()
+	dir.DialHook = func(string) error {
+		return ldap.NewError(ldap.ErrorNetwork, errors.New("connection refused"))
+	}
+
+	auth := newAuthenticator(t, dir,
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+		ldapauth.WithRetry(50),
+		ldapauth.WithRetryBackoff(50*time.Millisecond, time.Second, 2),
+		ldapauth.WithRetryMaxElapsed(time.Minute),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+
+	_, err := auth.Authenticate(ctx, "alice", alicePassword)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want the context's deadline", err)
+	}
+
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Errorf("the retry loop ran for %s after the caller gave up", elapsed)
+	}
+}
+
+func TestBackoffStopsWhenTheAuthenticatorCloses(t *testing.T) {
+	t.Parallel()
+
+	dir := newDirectory()
+	dir.DialHook = func(string) error {
+		return ldap.NewError(ldap.ErrorNetwork, errors.New("connection refused"))
+	}
+
+	auth := newAuthenticator(t, dir,
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+		ldapauth.WithRetry(50),
+		ldapauth.WithRetryBackoff(200*time.Millisecond, 2*time.Second, 2),
+		ldapauth.WithRetryMaxElapsed(time.Minute),
+	)
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := auth.Authenticate(context.Background(), "alice", alicePassword)
+		done <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if err := auth.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ldapauth.ErrClosed) {
+			t.Errorf("err = %v, want ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing did not interrupt the backoff")
+	}
+}
+
+func TestRetryGivesUpOnTheElapsedBudget(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int64
+
+	dir := newDirectory()
+	dir.DialHook = func(string) error {
+		attempts.Add(1)
+
+		return ldap.NewError(ldap.ErrorNetwork, errors.New("connection refused"))
+	}
+
+	auth := newAuthenticator(t, dir,
+		ldapauth.WithDirectBind("uid={{username}},"+peopleDN),
+		ldapauth.WithRetry(100),
+		ldapauth.WithRetryBackoff(20*time.Millisecond, 40*time.Millisecond, 2),
+		ldapauth.WithRetryMaxElapsed(120*time.Millisecond),
+	)
+
+	if _, err := auth.Authenticate(testContext(t), "alice", alicePassword); err == nil {
+		t.Fatal("Authenticate succeeded against a directory that never answered")
+	}
+
+	// The budget, not the attempt count, is what stopped it — so the
+	// attempts are far below the hundred that were allowed.
+	if got := attempts.Load(); got > 20 {
+		t.Errorf("dial attempts = %d, want the elapsed budget to have stopped it much sooner", got)
+	}
 }

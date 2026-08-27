@@ -1,26 +1,6 @@
-// Package ldapauthfiber is Fiber middleware for github.com/ctolon/ldap-authenticator.
-//
-// It is a separate module so that the root package can promise a single
-// dependency and mean it. The policy — group requirements, status codes,
-// response padding — lives in the httpauth package of the root module and
-// is shared with the other framework adapters.
-//
-//	app := fiber.New()
-//	app.Use(ldapauthfiber.BasicAuth(auth, httpauth.RequireAnyGroup("developers")))
-//	app.Get("/me", func(c *fiber.Ctx) error {
-//	    return c.JSON(ldapauthfiber.MustPrincipal(c))
-//	})
-//
-// Fiber is built on fasthttp rather than net/http, so this adapter does not
-// share the other three's request plumbing: it reads the Authorization
-// header and the body itself, and writes the rejection through Fiber. The
-// httpauth options that take an *http.Request — WithSkip and
-// WithErrorHandler — therefore do nothing here. Skip with Fiber's own
-// routing, and shape errors with a custom Fiber error handler.
 package ldapauthfiber
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -31,12 +11,12 @@ import (
 	"github.com/ctolon/ldap-authenticator/httpauth"
 )
 
-// ContextKey is the Locals key the principal is stored under.
-const ContextKey = "ldapauth.principal"
+// ContextKey is the Locals key the identity is stored under.
+const ContextKey = "ldapauth.identity"
 
 // BasicAuth returns middleware that authenticates every request with HTTP
 // Basic credentials.
-func BasicAuth(auth *ldapauth.Authenticator, opts ...httpauth.Option) fiber.Handler {
+func BasicAuth(auth ldapauth.Authenticator, opts ...httpauth.Option) fiber.Handler {
 	policy, err := httpauth.NewPolicy(opts...)
 	if err != nil {
 		panic(err)
@@ -52,12 +32,12 @@ func BasicAuth(auth *ldapauth.Authenticator, opts ...httpauth.Option) fiber.Hand
 			return reject(c, policy, httpauth.ErrNoCredentials)
 		}
 
-		principal, err := policy.Authenticate(c.UserContext(), auth, username, password)
+		identity, err := policy.Authenticate(c.UserContext(), auth, username, password)
 		if err != nil {
 			return reject(c, policy, err)
 		}
 
-		c.Locals(ContextKey, principal)
+		c.Locals(ContextKey, identity)
 
 		return c.Next()
 	}
@@ -67,8 +47,8 @@ func BasicAuth(auth *ldapauth.Authenticator, opts ...httpauth.Option) fiber.Hand
 // JSON body, form body, or Basic header — and hands the authenticated
 // principal to onSuccess.
 func LoginHandler(
-	auth *ldapauth.Authenticator,
-	onSuccess func(c *fiber.Ctx, p *ldapauth.Principal) error,
+	auth ldapauth.Authenticator,
+	onSuccess func(c *fiber.Ctx, p ldapauth.Identity) error,
 	opts ...httpauth.Option,
 ) fiber.Handler {
 	policy, err := httpauth.NewPolicy(opts...)
@@ -90,33 +70,45 @@ func LoginHandler(
 			return reject(c, policy, err)
 		}
 
-		principal, err := policy.Authenticate(c.UserContext(), auth, username, password)
+		identity, err := policy.Authenticate(c.UserContext(), auth, username, password)
 		if err != nil {
 			return reject(c, policy, err)
 		}
 
-		c.Locals(ContextKey, principal)
+		c.Locals(ContextKey, identity)
 
-		return onSuccess(c, principal)
+		return onSuccess(c, identity)
 	}
 }
 
-// PrincipalFrom returns the principal the middleware authenticated.
+// IdentityFrom returns the identity the middleware authenticated.
+func IdentityFrom(c *fiber.Ctx) (ldapauth.Identity, bool) {
+	identity, ok := c.Locals(ContextKey).(ldapauth.Identity)
+
+	return identity, ok
+}
+
+// PrincipalFrom returns the identity as the concrete
+// [ldapauth.Principal], for the common case where the mapper was not
+// replaced and reading fields is nicer than calling accessors.
 func PrincipalFrom(c *fiber.Ctx) (*ldapauth.Principal, bool) {
-	p, ok := c.Locals(ContextKey).(*ldapauth.Principal)
-
-	return p, ok
-}
-
-// MustPrincipal returns the authenticated principal and panics if there is
-// none, for handlers that are only ever mounted behind BasicAuth.
-func MustPrincipal(c *fiber.Ctx) *ldapauth.Principal {
-	p, ok := PrincipalFrom(c)
+	identity, ok := IdentityFrom(c)
 	if !ok {
-		panic("ldapauthfiber: no principal in context; the handler is not behind BasicAuth")
+		return nil, false
 	}
 
-	return p
+	return ldapauth.AsPrincipal(identity)
+}
+
+// MustIdentity returns the authenticated identity and panics if there is
+// none, for handlers that are only ever mounted behind BasicAuth.
+func MustIdentity(c *fiber.Ctx) ldapauth.Identity {
+	identity, ok := IdentityFrom(c)
+	if !ok {
+		panic("ldapauthfiber: no identity in context; the handler is not behind BasicAuth")
+	}
+
+	return identity
 }
 
 // credentials reads a username and password from wherever the request put
@@ -151,27 +143,23 @@ func credentials(c *fiber.Ctx) (username, password string, err error) {
 	}
 }
 
-// basicCredentials parses an RFC 7617 Basic header. net/http has this, and
-// fasthttp does not.
+// basicCredentials parses an RFC 7617 Basic header.
+//
+// fasthttp has no equivalent of net/http's BasicAuth, so the header is
+// handed to net/http's parser through a bare Request rather than being
+// parsed again here. RFC 7617 has more corners than it looks — a password
+// may legitimately contain a colon, the payload need not be UTF-8, and
+// getting the base64 padding wrong turns a rejection into a panic — and
+// none of them are worth meeting twice.
 func basicCredentials(c *fiber.Ctx) (username, password string, ok bool) {
 	header := c.Get(fiber.HeaderAuthorization)
-
-	const prefix = "basic "
-	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+	if header == "" {
 		return "", "", false
 	}
 
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(header[len(prefix):]))
-	if err != nil {
-		return "", "", false
-	}
+	probe := &http.Request{Header: http.Header{"Authorization": []string{header}}}
 
-	user, pass, found := strings.Cut(string(decoded), ":")
-	if !found {
-		return "", "", false
-	}
-
-	return user, pass, true
+	return probe.BasicAuth()
 }
 
 // reject writes the response for a failed authentication, using the same

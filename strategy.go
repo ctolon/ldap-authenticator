@@ -25,10 +25,6 @@ type resolved struct {
 	// has one to spare for further reads. The caller owns it and must
 	// close it.
 	conn Conn
-
-	// groupNames memoises group DN to group name for the duration of one
-	// request; see (*resolved).rememberGroupName.
-	groupNames map[string]string
 }
 
 func (r *resolved) close() {
@@ -45,7 +41,7 @@ func (r *resolved) close() {
 // The username is escaped as an RFC 4514 attribute value on the way into
 // the template, so a username of `x,ou=admins` names an entry whose CN
 // contains a comma rather than an entry in another subtree.
-func (a *Authenticator) directBind(ctx context.Context, username, password string) (*resolved, error) {
+func (a *Client) directBind(ctx context.Context, username, password string) (*resolved, error) {
 	dn := a.cfg.bindDN.expand(escapeDNValue, map[string]string{placeholderUsername: username})
 
 	conn, url, err := a.bindAs(ctx, dn, password)
@@ -104,7 +100,7 @@ func (a *Authenticator) directBind(ctx context.Context, username, password strin
 // afterwards and never returned to the pool. This is the whole reason the
 // pool holds only the service identity: a pooled connection rebound as the
 // user would answer the next request's searches as that user.
-func (a *Authenticator) searchThenBind(ctx context.Context, username, password string) (*resolved, error) {
+func (a *Client) searchThenBind(ctx context.Context, username, password string) (*resolved, error) {
 	entry, err := a.withPooledConn(ctx, func(pooled Conn) (*ldap.Entry, error) {
 		return a.searchUser(pooled, username)
 	})
@@ -122,7 +118,7 @@ func (a *Authenticator) searchThenBind(ctx context.Context, username, password s
 
 // searchUser runs the configured user filter and insists on exactly one
 // match.
-func (a *Authenticator) searchUser(conn Conn, username string) (*ldap.Entry, error) {
+func (a *Client) searchUser(conn Conn, username string) (*ldap.Entry, error) {
 	filter := a.cfg.userFilter.expandFilter(map[string]string{
 		placeholderUsername: username,
 		placeholderBaseDN:   a.cfg.userBaseDN,
@@ -133,7 +129,7 @@ func (a *Authenticator) searchUser(conn Conn, username string) (*ldap.Entry, err
 		a.cfg.userScope,
 		a.cfg.userDerefAliases,
 		a.cfg.userSizeLimit,
-		a.searchTimeLimit(),
+		a.cfg.searchTimeLimit(),
 		false,
 		filter,
 		a.cfg.attributeList(),
@@ -177,13 +173,13 @@ func (a *Authenticator) searchUser(conn Conn, username string) (*ldap.Entry, err
 
 // readEntry fetches one entry by DN, for the direct-bind path where there
 // is nothing to search for.
-func (a *Authenticator) readEntry(conn Conn, dn string) (*ldap.Entry, error) {
+func (a *Client) readEntry(conn Conn, dn string) (*ldap.Entry, error) {
 	request := ldap.NewSearchRequest(
 		dn,
 		ScopeBaseObject,
 		a.cfg.userDerefAliases,
 		1,
-		a.searchTimeLimit(),
+		a.cfg.searchTimeLimit(),
 		false,
 		"(objectClass=*)",
 		a.cfg.attributeList(),
@@ -213,7 +209,7 @@ func (a *Authenticator) readEntry(conn Conn, dn string) (*ldap.Entry, error) {
 // the wire, and the cost of the check is a string comparison. See
 // ErrEmptyPassword for why an empty password is not merely invalid but
 // dangerous.
-func (a *Authenticator) bindAs(ctx context.Context, dn, password string) (Conn, string, error) {
+func (a *Client) bindAs(ctx context.Context, dn, password string) (Conn, string, error) {
 	if password == "" {
 		return nil, "", ErrEmptyPassword
 	}
@@ -251,7 +247,7 @@ func (a *Authenticator) bindAs(ctx context.Context, dn, password string) (Conn, 
 // search issues a search, paging it when the configuration asks for
 // paging. Paging matters on Active Directory, which caps a search at 1000
 // entries by default and truncates rather than erroring past it.
-func (a *Authenticator) search(conn Conn, request *ldap.SearchRequest) (*ldap.SearchResult, error) {
+func (a *Client) search(conn Conn, request *ldap.SearchRequest) (*ldap.SearchResult, error) {
 	if a.cfg.pagingSize > 0 {
 		return conn.SearchWithPaging(request, a.cfg.pagingSize)
 	}
@@ -259,21 +255,9 @@ func (a *Authenticator) search(conn Conn, request *ldap.SearchRequest) (*ldap.Se
 	return conn.Search(request)
 }
 
-// searchTimeLimit is the server-side time limit, in seconds, derived from
-// the operation timeout. Rounding up by a second keeps the server's own
-// limit from firing just before the client's and turning a clean timeout
-// into a race.
-func (a *Authenticator) searchTimeLimit() int {
-	if a.cfg.operationTimeout <= 0 {
-		return 0
-	}
-
-	return int(a.cfg.operationTimeout.Seconds()) + 1
-}
-
 // withPooledConn runs fn on a service-account connection and returns it to
 // the pool afterwards, closed if fn failed.
-func (a *Authenticator) withPooledConn(ctx context.Context, fn func(Conn) (*ldap.Entry, error)) (*ldap.Entry, error) {
+func (a *Client) withPooledConn(ctx context.Context, fn func(Conn) (*ldap.Entry, error)) (*ldap.Entry, error) {
 	if a.pool == nil {
 		return nil, fmt.Errorf("%w: no service connection is configured", ErrInvalidOption)
 	}

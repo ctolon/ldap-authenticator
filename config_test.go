@@ -277,7 +277,7 @@ func TestStatsOnAFreshAuthenticator(t *testing.T) {
 
 	auth := searchAuth(t, newDirectory())
 
-	stats := auth.Stats()
+	stats := auth.Stats(testContext(t))
 
 	if stats.Servers != 1 {
 		t.Errorf("Servers = %d, want 1", stats.Servers)

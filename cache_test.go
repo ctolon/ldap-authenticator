@@ -24,7 +24,7 @@ func TestCacheServesRepeatLogins(t *testing.T) {
 		t.Errorf("binds = %d, want at most 2: the service bind and one user bind", binds)
 	}
 
-	if entries := auth.Stats().CacheEntries; entries != 1 {
+	if entries := auth.Stats(testContext(t)).CacheEntries; entries != 1 {
 		t.Errorf("CacheEntries = %d, want 1", entries)
 	}
 }
@@ -124,7 +124,7 @@ func TestFailuresThatAreNotAboutTheCredentialAreNotCached(t *testing.T) {
 		t.Fatal("Authenticate succeeded against a directory that is down")
 	}
 
-	if entries := auth.Stats().CacheEntries; entries != 0 {
+	if entries := auth.Stats(testContext(t)).CacheEntries; entries != 0 {
 		t.Errorf("CacheEntries = %d, want 0", entries)
 	}
 
@@ -145,7 +145,12 @@ func TestInvalidateUserDropsTheEntry(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if dropped := auth.InvalidateUser("ALICE"); dropped != 1 {
+	dropped, err := auth.InvalidateUser(testContext(t), "ALICE")
+	if err != nil {
+		t.Fatalf("InvalidateUser: %v", err)
+	}
+
+	if dropped != 1 {
 		t.Errorf("InvalidateUser dropped %d entries, want 1 — the match should be case-insensitive", dropped)
 	}
 
@@ -174,11 +179,16 @@ func TestInvalidateAllEmptiesTheCache(t *testing.T) {
 		}
 	}
 
-	if dropped := auth.InvalidateAll(); dropped != 2 {
+	dropped, err := auth.InvalidateAll(testContext(t))
+	if err != nil {
+		t.Fatalf("InvalidateAll: %v", err)
+	}
+
+	if dropped != 2 {
 		t.Errorf("InvalidateAll dropped %d entries, want 2", dropped)
 	}
 
-	if entries := auth.Stats().CacheEntries; entries != 0 {
+	if entries := auth.Stats(testContext(t)).CacheEntries; entries != 0 {
 		t.Errorf("CacheEntries = %d, want 0", entries)
 	}
 }
@@ -196,7 +206,7 @@ func TestCacheIsBounded(t *testing.T) {
 		_, _ = auth.Authenticate(testContext(t), "alice", string(rune('a'+i)))
 	}
 
-	if entries := auth.Stats().CacheEntries; entries > 4 {
+	if entries := auth.Stats(testContext(t)).CacheEntries; entries > 4 {
 		t.Errorf("CacheEntries = %d, want at most the configured 4", entries)
 	}
 }
@@ -214,15 +224,20 @@ func TestCachedPrincipalsAreCopies(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	first.Groups[0] = "tampered"
-	first.DN = "cn=tampered"
+	principal, ok := ldapauth.AsPrincipal(first)
+	if !ok {
+		t.Fatalf("Authenticate returned %T, want the default *Principal", first)
+	}
+
+	principal.Groups[0] = "tampered"
+	principal.DN = "cn=tampered"
 
 	second, err := auth.Authenticate(testContext(t), "alice", alicePassword)
 	if err != nil {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if second.DN == "cn=tampered" || second.Groups[0] == "tampered" {
+	if second.GetDN() == "cn=tampered" || second.GetGroups()[0] == "tampered" {
 		t.Fatal("editing a principal changed what the cache serves next")
 	}
 }

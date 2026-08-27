@@ -105,7 +105,7 @@ func main() {
 	}
 }
 
-func build(url, bindDN string, insecure bool, logger *slog.Logger) (*ldapauth.Authenticator, error) {
+func build(url, bindDN string, insecure bool, logger *slog.Logger) (ldapauth.Authenticator, error) {
 	opts := []ldapauth.Option{
 		ldapauth.WithDirectBind(bindDN),
 		ldapauth.WithMemberOfGroups(),
@@ -149,27 +149,27 @@ func demoDirectory() *ldaptest.Directory {
 }
 
 func private(w http.ResponseWriter, r *http.Request) {
-	principal := httpauth.MustPrincipal(r.Context())
+	identity := httpauth.MustIdentity(r.Context())
 
 	w.Header().Set("Content-Type", "application/json")
 
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"dn":     principal.DN,
-		"name":   principal.DisplayName,
-		"email":  principal.Email,
-		"groups": principal.Groups,
+		"dn":     identity.GetDN(),
+		"name":   identity.GetDisplayName(),
+		"email":  identity.GetEmail(),
+		"groups": identity.GetGroups(),
 	})
 }
 
 // loggedIn is where an application would start a session. This one only
 // says who logged in, because what a session looks like is not a decision
 // a library should make for you.
-func loggedIn(w http.ResponseWriter, _ *http.Request, p *ldapauth.Principal) {
+func loggedIn(w http.ResponseWriter, _ *http.Request, identity ldapauth.Identity) {
 	w.Header().Set("Content-Type", "application/json")
 
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"authenticated": true,
-		"dn":            p.DN,
-		"groups":        p.Groups,
+		"dn":            identity.GetDN(),
+		"groups":        identity.GetGroups(),
 	})
 }

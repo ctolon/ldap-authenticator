@@ -21,41 +21,54 @@ var (
 	ErrMalformedRequest = errors.New("httpauth: request is not a login")
 )
 
-// principalKey is the context key the principal is stored under. It is an
+// identityKey is the context key the identity is stored under. It is an
 // unexported type so that nothing else can collide with it, and there is
-// no option to change it: a caller who wants the principal elsewhere in
+// no option to change it: a caller who wants the identity elsewhere in
 // their own context can put it there.
-type principalKey struct{}
+type identityKey struct{}
 
-// PrincipalFrom returns the principal the middleware authenticated, if the
+// IdentityFrom returns the identity the middleware authenticated, if the
 // request went through it.
-func PrincipalFrom(ctx context.Context) (*ldapauth.Principal, bool) {
-	p, ok := ctx.Value(principalKey{}).(*ldapauth.Principal)
+func IdentityFrom(ctx context.Context) (ldapauth.Identity, bool) {
+	identity, ok := ctx.Value(identityKey{}).(ldapauth.Identity)
 
-	return p, ok
+	return identity, ok
 }
 
-// MustPrincipal returns the authenticated principal and panics if there is
+// MustIdentity returns the authenticated identity and panics if there is
 // none. Use it in a handler that is only ever mounted behind BasicAuth,
-// where a missing principal is a routing mistake rather than a runtime
+// where a missing identity is a routing mistake rather than a runtime
 // condition.
-func MustPrincipal(ctx context.Context) *ldapauth.Principal {
-	p, ok := PrincipalFrom(ctx)
+func MustIdentity(ctx context.Context) ldapauth.Identity {
+	identity, ok := IdentityFrom(ctx)
 	if !ok {
-		panic("httpauth: no principal in context; the handler is not behind BasicAuth")
+		panic("httpauth: no identity in context; the handler is not behind BasicAuth")
 	}
 
-	return p
+	return identity
 }
 
-// WithPrincipal returns a context carrying the principal, for adapters and
+// PrincipalFrom returns the identity as the concrete [ldapauth.Principal],
+// for the common case where the mapper was not replaced and reading fields
+// is nicer than calling accessors. It reports false both when there is no
+// identity and when the identity is some other implementation.
+func PrincipalFrom(ctx context.Context) (*ldapauth.Principal, bool) {
+	identity, ok := IdentityFrom(ctx)
+	if !ok {
+		return nil, false
+	}
+
+	return ldapauth.AsPrincipal(identity)
+}
+
+// WithIdentity returns a context carrying the identity, for adapters and
 // for tests that need to exercise a handler without a directory behind it.
-func WithPrincipal(ctx context.Context, p *ldapauth.Principal) context.Context {
-	return context.WithValue(ctx, principalKey{}, p)
+func WithIdentity(ctx context.Context, identity ldapauth.Identity) context.Context {
+	return context.WithValue(ctx, identityKey{}, identity)
 }
 
 // BasicAuth returns middleware that authenticates every request with HTTP
-// Basic credentials and puts the resulting principal in the request
+// Basic credentials and puts the resulting identity in the request
 // context.
 //
 //	mux.Handle("/private", httpauth.BasicAuth(auth,
@@ -70,7 +83,7 @@ func WithPrincipal(ctx context.Context, p *ldapauth.Principal) context.Context {
 // An option that does not validate panics, because a middleware chain is
 // built at startup and there is nowhere to return an error to. Use
 // [NewPolicy] and [Middleware] if you would rather handle it.
-func BasicAuth(auth *ldapauth.Authenticator, opts ...Option) func(http.Handler) http.Handler {
+func BasicAuth(auth ldapauth.Authenticator, opts ...Option) func(http.Handler) http.Handler {
 	policy, err := NewPolicy(opts...)
 	if err != nil {
 		panic(err)
@@ -80,7 +93,7 @@ func BasicAuth(auth *ldapauth.Authenticator, opts ...Option) func(http.Handler) 
 }
 
 // Middleware is BasicAuth with the policy already resolved.
-func Middleware(auth *ldapauth.Authenticator, policy *Policy) func(http.Handler) http.Handler {
+func Middleware(auth ldapauth.Authenticator, policy *Policy) func(http.Handler) http.Handler {
 	if auth == nil {
 		panic("httpauth: nil authenticator")
 	}
@@ -100,14 +113,14 @@ func Middleware(auth *ldapauth.Authenticator, policy *Policy) func(http.Handler)
 				return
 			}
 
-			principal, err := policy.Authenticate(r.Context(), auth, username, password)
+			identity, err := policy.Authenticate(r.Context(), auth, username, password)
 			if err != nil {
 				policy.Reject(w, r, err)
 
 				return
 			}
 
-			next.ServeHTTP(w, r.WithContext(WithPrincipal(r.Context(), principal)))
+			next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), identity)))
 		})
 	}
 }
@@ -128,13 +141,13 @@ func Middleware(auth *ldapauth.Authenticator, policy *Policy) func(http.Handler)
 // had to work around.
 //
 //	http.Handle("POST /login", httpauth.LoginHandler(auth,
-//	    func(w http.ResponseWriter, r *http.Request, p *ldapauth.Principal) {
-//	        session.Start(w, p.DN, p.Groups)
+//	    func(w http.ResponseWriter, r *http.Request, id ldapauth.Identity) {
+//	        session.Start(w, id.GetDN(), id.GetGroups())
 //	    },
 //	))
 func LoginHandler(
-	auth *ldapauth.Authenticator,
-	onSuccess func(w http.ResponseWriter, r *http.Request, p *ldapauth.Principal),
+	auth ldapauth.Authenticator,
+	onSuccess func(w http.ResponseWriter, r *http.Request, identity ldapauth.Identity),
 	opts ...Option,
 ) http.HandlerFunc {
 	policy, err := NewPolicy(opts...)
@@ -158,14 +171,14 @@ func LoginHandler(
 			return
 		}
 
-		principal, err := policy.Authenticate(r.Context(), auth, username, password)
+		identity, err := policy.Authenticate(r.Context(), auth, username, password)
 		if err != nil {
 			policy.Reject(w, r, err)
 
 			return
 		}
 
-		onSuccess(w, r.WithContext(WithPrincipal(r.Context(), principal)), principal)
+		onSuccess(w, r.WithContext(WithIdentity(r.Context(), identity)), identity)
 	}
 }
 

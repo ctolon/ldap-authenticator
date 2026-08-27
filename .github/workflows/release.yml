@@ -13,22 +13,37 @@ on:
         description: tag to release
         required: true
 
+# Read-only at the top. Only the publish job is given write, and only to
+# contents: a release workflow with more access than it needs is a release
+# workflow that can do more than release.
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  # One release at a time, and never cancel one halfway: a half-published
+  # tag is worse than a slow queue.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   verify:
     name: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       version: ${{ steps.parse.outputs.version }}
       module: ${{ steps.parse.outputs.module }}
       prerelease: ${{ steps.parse.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
 
@@ -83,16 +98,46 @@ jobs:
           go build ./...
           go test ./...
 
+  # The release is published for every platform, so it is tested on every
+  # platform we have a runner for. A release that only ever ran on Linux
+  # is a release that says nothing about Windows.
+  platforms:
+    name: tests (${{ matrix.os }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - run: go test -race -count=1 ./...
+      - name: the contrib modules too
+        shell: bash
+        run: |
+          for module in contrib/gin contrib/echo contrib/fiber; do
+            ( cd "$module" && go test -race -count=1 ./... )
+          done
+
   publish:
     name: publish
-    needs: verify
+    needs: [verify, platforms]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - id: notes
         name: build the release notes
@@ -124,7 +169,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: publish the release
-        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           body: ${{ steps.notes.outputs.body }}
@@ -132,10 +177,11 @@ jobs:
 
   index:
     name: warm the module proxy
-    needs: [verify, publish]
+    needs: [verify, platforms, publish]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
       - name: ask the proxy for the new version

@@ -18,13 +18,19 @@ CONTRIB := contrib/gin contrib/echo contrib/fiber
 # when there is a reason to.
 STATICCHECK_VERSION ?= v0.8.1
 GOVULNCHECK_VERSION ?= v1.7.0
+ACTIONLINT_VERSION ?= v1.7.7
+
+# The coverage floor. It is a ratchet, not a target: raise it when the
+# number goes up, and treat a drop as a change that removed a test rather
+# than as a number to argue with.
+COVERAGE_MIN ?= 82.0
 
 .PHONY: all
 all: check
 
 ## check: the full gate — format, vet, lint, race tests, fuzz smoke, dependencies, vulnerabilities
 .PHONY: check
-check: fmt-check vet staticcheck test-race contrib deps-guard fuzz-smoke vuln
+check: fmt-check vet staticcheck doc-check docs-check test-race contrib cross-compile deps-guard coverage fuzz-smoke vuln actionlint
 
 ## test: run every test in the root module
 .PHONY: test
@@ -43,6 +49,34 @@ contrib:
 		echo "==> $$module"; \
 		( cd $$module && $(GO) build ./... && $(GO) vet ./... && $(GO) test -race -count=1 ./... ) || exit 1; \
 	done
+
+## cross-compile: build for every platform this library claims to support
+.PHONY: cross-compile
+cross-compile:
+	@./scripts/cross-compile.sh
+
+## coverage: run the tests with coverage and fail below the floor
+.PHONY: coverage
+coverage:
+	@./scripts/coverage.sh $(COVERAGE_MIN)
+
+## doc-check: fail if any exported declaration has no doc comment
+.PHONY: doc-check
+doc-check:
+	$(GO) run ./internal/tools/doccheck .
+	@for module in $(CONTRIB); do \
+		( cd $$module && $(GO) run ../../internal/tools/doccheck . ) || exit 1; \
+	done
+
+## docs-check: fail if the documentation and the repository disagree
+.PHONY: docs-check
+docs-check:
+	@./scripts/docs-check.sh
+
+## actionlint: lint the GitHub workflows
+.PHONY: actionlint
+actionlint:
+	$(GO) run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
 
 ## deps-guard: assert the root module still has exactly one direct dependency
 .PHONY: deps-guard
@@ -72,10 +106,7 @@ bench-compile:
 ## fuzz-smoke: run each fuzz target briefly, as CI does on every push
 .PHONY: fuzz-smoke
 fuzz-smoke:
-	$(GO) test -run '^$$' -fuzz FuzzEscapeFilterValue -fuzztime $(FUZZTIME) .
-	$(GO) test -run '^$$' -fuzz FuzzEscapeDNValue -fuzztime $(FUZZTIME) .
-	$(GO) test -run '^$$' -fuzz FuzzParseTemplate -fuzztime $(FUZZTIME) .
-	$(GO) test -run '^$$' -fuzz FuzzCheckUsername -fuzztime $(FUZZTIME) .
+	@./scripts/fuzz.sh $(FUZZTIME)
 
 ## fmt: format the tree
 .PHONY: fmt

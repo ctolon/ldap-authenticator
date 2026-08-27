@@ -8,7 +8,7 @@ import (
 	"github.com/ctolon/ldap-authenticator/ldaptest"
 )
 
-func groupsOf(t *testing.T, auth *ldapauth.Authenticator, username, password string) []string {
+func groupsOf(t *testing.T, auth *ldapauth.Client, username, password string) []string {
 	t.Helper()
 
 	p, err := auth.Authenticate(testContext(t), username, password)
@@ -16,7 +16,7 @@ func groupsOf(t *testing.T, auth *ldapauth.Authenticator, username, password str
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	groups := append([]string(nil), p.Groups...)
+	groups := append([]string(nil), p.GetGroups()...)
 	sort.Strings(groups)
 
 	return groups
@@ -216,14 +216,19 @@ func TestGroupsAreNotSharedBetweenPrincipals(t *testing.T) {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	first.Groups[0] = "tampered"
+	principal, ok := ldapauth.AsPrincipal(first)
+	if !ok {
+		t.Fatalf("Authenticate returned %T, want the default *Principal", first)
+	}
+
+	principal.Groups[0] = "tampered"
 
 	second, err := auth.Authenticate(testContext(t), "alice", alicePassword)
 	if err != nil {
 		t.Fatalf("Authenticate: %v", err)
 	}
 
-	if second.Groups[0] == "tampered" {
+	if second.GetGroups()[0] == "tampered" {
 		t.Fatal("editing one principal's groups changed the next one's")
 	}
 }

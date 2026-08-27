@@ -15,8 +15,8 @@ changelog, unless you would rather not be.
 
 ## Supported versions
 
-The most recent release. Before 1.0 there are no backports: a fix goes into
-the next release and the next release is the supported one.
+The most recent 1.x release. A security fix goes out as a patch release on
+that line; there are no backports to older 1.x patches.
 
 ## What this library promises
 
@@ -37,7 +37,12 @@ the next release and the next release is the supported one.
 - A plaintext `ldap://` URL is refused unless StartTLS is configured or
   `WithInsecureNoTLS` is passed explicitly.
 - No password reaches a log record, an error message, or the cache. The
-  cache key is an HMAC under a per-process random key.
+  cache key is an HMAC derived before any `Cache` implementation is
+  reached, so a store — including a shared, remote one — never sees a
+  credential.
+- A password longer than the configured maximum is refused before any
+  network call, as is a username that is empty, overlong, not valid UTF-8,
+  or carrying a control character.
 
 ## What it does not promise
 
@@ -48,6 +53,13 @@ put in an authorisation rule is the group you meant. Nor is it a
 constant-time authenticator: `WithMinimumDuration` in the httpauth package
 pads a response, but anything built on a network round trip leaks some
 timing, and this one does not pretend otherwise.
+
+There is one thing worth stating plainly because it is a choice rather than
+an oversight: `WithCacheSecret` is a real secret. Anybody holding it can
+test a guessed credential against a shared cache offline, without touching
+the directory and without the directory noticing. Keep it where you keep
+the service account password, and remember that a cache shared between two
+services turns one service's authentication decisions into the other's.
 
 A password appearing in a log line, an error string, a `Stats` field, or a
 cache entry is a vulnerability. Please report it.

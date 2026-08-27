@@ -33,6 +33,8 @@ const (
 	FailoverRandom
 )
 
+// String returns a stable, lower-case name for the policy, suitable for
+// a log field or a metrics label.
 func (p FailoverPolicy) String() string {
 	switch p {
 	case FailoverInOrder:

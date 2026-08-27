@@ -22,7 +22,7 @@ const (
 	opsDN    = "cn=ops," + groupsDN
 )
 
-func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Authenticator {
+func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	dir := ldaptest.New(
@@ -53,18 +53,16 @@ func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Authenticator {
 	return auth
 }
 
-// echoPrincipal writes the authenticated username, so that a test can tell
-// which principal reached the handler.
-var echoPrincipal = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	p := httpauth.MustPrincipal(r.Context())
-
-	_, _ = w.Write([]byte(p.Username))
+// echoIdentity writes the authenticated username, so that a test can tell
+// which identity reached the handler.
+var echoIdentity = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	_, _ = w.Write([]byte(httpauth.MustIdentity(r.Context()).GetUsername()))
 })
 
 func TestBasicAuthAdmitsValidCredentials(t *testing.T) {
 	t.Parallel()
 
-	handler := httpauth.BasicAuth(newAuth(t))(echoPrincipal)
+	handler := httpauth.BasicAuth(newAuth(t))(echoIdentity)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	req.SetBasicAuth("alice", "alice-pw")
@@ -84,7 +82,7 @@ func TestBasicAuthAdmitsValidCredentials(t *testing.T) {
 func TestBasicAuthChallengesAMissingHeader(t *testing.T) {
 	t.Parallel()
 
-	handler := httpauth.BasicAuth(newAuth(t), httpauth.WithRealm("corp"))(echoPrincipal)
+	handler := httpauth.BasicAuth(newAuth(t), httpauth.WithRealm("corp"))(echoIdentity)
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/private", nil))
@@ -102,7 +100,7 @@ func TestBasicAuthChallengesAMissingHeader(t *testing.T) {
 func TestBasicAuthRejectsAWrongPassword(t *testing.T) {
 	t.Parallel()
 
-	handler := httpauth.BasicAuth(newAuth(t))(echoPrincipal)
+	handler := httpauth.BasicAuth(newAuth(t))(echoIdentity)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	req.SetBasicAuth("alice", "wrong")
@@ -122,7 +120,7 @@ func TestBasicAuthRejectsAWrongPassword(t *testing.T) {
 func TestBasicAuthRejectsAnEmptyPasswordAsABadRequest(t *testing.T) {
 	t.Parallel()
 
-	handler := httpauth.BasicAuth(newAuth(t))(echoPrincipal)
+	handler := httpauth.BasicAuth(newAuth(t))(echoIdentity)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	req.SetBasicAuth("alice", "")
@@ -142,7 +140,7 @@ func TestGroupRequirementIsForbiddenNotUnauthorised(t *testing.T) {
 	// credentials, 403 says do not bother.
 	auth := newAuth(t, ldapauth.WithMemberOfGroups())
 
-	handler := httpauth.BasicAuth(auth, httpauth.RequireAnyGroup("ops"))(echoPrincipal)
+	handler := httpauth.BasicAuth(auth, httpauth.RequireAnyGroup("ops"))(echoIdentity)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	req.SetBasicAuth("alice", "alice-pw")
@@ -160,7 +158,7 @@ func TestRequireAnyGroupAdmitsAMember(t *testing.T) {
 
 	auth := newAuth(t, ldapauth.WithMemberOfGroups())
 
-	handler := httpauth.BasicAuth(auth, httpauth.RequireAnyGroup("ops", "devs"))(echoPrincipal)
+	handler := httpauth.BasicAuth(auth, httpauth.RequireAnyGroup("ops", "devs"))(echoIdentity)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	req.SetBasicAuth("alice", "alice-pw")
@@ -178,7 +176,7 @@ func TestRequireAllGroups(t *testing.T) {
 
 	auth := newAuth(t, ldapauth.WithMemberOfGroups())
 
-	handler := httpauth.BasicAuth(auth, httpauth.RequireAllGroups("devs", "ops"))(echoPrincipal)
+	handler := httpauth.BasicAuth(auth, httpauth.RequireAllGroups("devs", "ops"))(echoIdentity)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	req.SetBasicAuth("alice", "alice-pw")
@@ -209,7 +207,7 @@ func TestDirectoryFailureIsServiceUnavailable(t *testing.T) {
 
 	defer func() { _ = auth.Close() }()
 
-	handler := httpauth.BasicAuth(auth)(echoPrincipal)
+	handler := httpauth.BasicAuth(auth)(echoIdentity)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	req.SetBasicAuth("alice", "alice-pw")
@@ -250,7 +248,7 @@ func TestCustomErrorHandler(t *testing.T) {
 				_, _ = w.Write([]byte("nope"))
 			}
 		}),
-	)(echoPrincipal)
+	)(echoIdentity)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	req.SetBasicAuth("alice", "wrong")
@@ -267,8 +265,8 @@ func TestLoginHandlerAcceptsJSON(t *testing.T) {
 	t.Parallel()
 
 	handler := httpauth.LoginHandler(newAuth(t),
-		func(w http.ResponseWriter, _ *http.Request, p *ldapauth.Principal) {
-			_, _ = w.Write([]byte(p.DN))
+		func(w http.ResponseWriter, _ *http.Request, identity ldapauth.Identity) {
+			_, _ = w.Write([]byte(identity.GetDN()))
 		},
 	)
 
@@ -292,8 +290,8 @@ func TestLoginHandlerAcceptsAForm(t *testing.T) {
 	t.Parallel()
 
 	handler := httpauth.LoginHandler(newAuth(t),
-		func(w http.ResponseWriter, _ *http.Request, p *ldapauth.Principal) {
-			_, _ = w.Write([]byte(p.Username))
+		func(w http.ResponseWriter, _ *http.Request, identity ldapauth.Identity) {
+			_, _ = w.Write([]byte(identity.GetUsername()))
 		},
 	)
 
@@ -312,7 +310,7 @@ func TestLoginHandlerRejectsAMalformedBody(t *testing.T) {
 	t.Parallel()
 
 	handler := httpauth.LoginHandler(newAuth(t),
-		func(http.ResponseWriter, *http.Request, *ldapauth.Principal) {
+		func(http.ResponseWriter, *http.Request, ldapauth.Identity) {
 			t.Error("the success handler ran for a malformed body")
 		},
 	)
@@ -332,7 +330,7 @@ func TestLoginHandlerBoundsTheBody(t *testing.T) {
 	t.Parallel()
 
 	handler := httpauth.LoginHandler(newAuth(t),
-		func(http.ResponseWriter, *http.Request, *ldapauth.Principal) {
+		func(http.ResponseWriter, *http.Request, ldapauth.Identity) {
 			t.Error("the success handler ran for an oversized body")
 		},
 		httpauth.WithMaxBodyBytes(32),
@@ -353,7 +351,7 @@ func TestLoginHandlerBoundsTheBody(t *testing.T) {
 func TestMinimumDurationPadsTheResponse(t *testing.T) {
 	t.Parallel()
 
-	handler := httpauth.BasicAuth(newAuth(t), httpauth.WithMinimumDuration(40*time.Millisecond))(echoPrincipal)
+	handler := httpauth.BasicAuth(newAuth(t), httpauth.WithMinimumDuration(40*time.Millisecond))(echoIdentity)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	req.SetBasicAuth("alice", "wrong")
@@ -403,7 +401,7 @@ func TestPrincipalIsAbsentWithoutTheMiddleware(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 
-	if _, ok := httpauth.PrincipalFrom(req.Context()); ok {
+	if _, ok := httpauth.IdentityFrom(req.Context()); ok {
 		t.Fatal("a principal appeared in a context that never went through the middleware")
 	}
 }

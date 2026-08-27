@@ -4,6 +4,7 @@
 [![Security](https://github.com/ctolon/ldap-authenticator/actions/workflows/security.yml/badge.svg)](https://github.com/ctolon/ldap-authenticator/actions/workflows/security.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/ctolon/ldap-authenticator.svg)](https://pkg.go.dev/github.com/ctolon/ldap-authenticator)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ctolon/ldap-authenticator)](https://goreportcard.com/report/github.com/ctolon/ldap-authenticator)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/ctolon/ldap-authenticator/badge)](https://scorecard.dev/viewer/?uri=github.com/ctolon/ldap-authenticator)
 ![Go 1.25+](https://img.shields.io/badge/Go-1.25%2B-00ADD8)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -26,7 +27,7 @@ if err != nil {
 }
 defer auth.Close()
 
-principal, err := auth.Authenticate(ctx, username, password)
+identity, err := auth.Authenticate(ctx, username, password)
 switch {
 case err == nil:                                     // authenticated
 case errors.Is(err, ldapauth.ErrInvalidCredentials): // 401
@@ -36,6 +37,47 @@ default:                                             // 503
 
 The only direct dependency is `github.com/go-ldap/ldap/v3`, and a CI job
 fails the build if that ever stops being true.
+
+## Everything is a seam
+
+Seven interfaces, each with a working default, each replaceable on its own.
+None of them has to be thought about to use this package, and none of them
+costs a dependency.
+
+| | replaces | with |
+|---|---|---|
+| `Authenticator` | what `New` returns | a fake, or a decorator with a circuit breaker |
+| `Identity` | what `Authenticate` returns | your application's own user type |
+| `PrincipalMapper` | how an entry becomes an identity | `WithPrincipalMapper` |
+| `GroupResolver` | where groups come from | `WithGroupResolver` |
+| `Cache` | where outcomes are remembered | `WithCacheStore` |
+| `Dialer` | where connections come from | `WithDialer` |
+| `Metrics` | where the numbers go | `WithMetrics` |
+
+`Identity`'s accessors are spelled `GetDN`, `GetGroups`, and so on, because
+`Principal` carries the same information as exported fields and a field and
+a method cannot share a name. It is the spelling go-ldap itself uses for
+`ldap.Entry`.
+
+`Principal` is the `Identity` this package produces, and it stays a plain
+struct with exported fields — construct one in a test, read it in a
+handler:
+
+```go
+if p, ok := ldapauth.AsPrincipal(identity); ok {
+    log.Println(p.DN, p.Groups, p.Attributes)
+}
+```
+
+Supply your own when the directory is not the whole story:
+
+```go
+ldapauth.WithPrincipalMapper(ldapauth.PrincipalMapperFunc(
+    func(m ldapauth.Mapping) (ldapauth.Identity, error) {
+        return &user{dn: m.DN, name: m.Username, groups: m.Groups, tenant: tenantOf(m.Entry)}, nil
+    },
+))
+```
 
 ## What this is not
 
@@ -58,7 +100,8 @@ importing this package never puts Gin in your build graph.
 go get github.com/ctolon/ldap-authenticator
 ```
 
-And, if you want the framework middleware:
+And, if you want the framework middleware — each is its own module, with
+its own README:
 
 ```sh
 go get github.com/ctolon/ldap-authenticator/contrib/gin
@@ -67,7 +110,8 @@ go get github.com/ctolon/ldap-authenticator/contrib/fiber
 ```
 
 net/http needs no extra module: `httpauth` is in the root module, because
-it needs nothing outside the standard library.
+it needs nothing outside the standard library. See
+[docs/http.md](docs/http.md).
 
 ## Two strategies, and how to pick
 
@@ -125,7 +169,7 @@ ldapauth.WithActiveDirectoryGroups(groupsDN)           // one search, transitive
 ```
 
 ```go
-if principal.InAnyGroup("developers", "ops") { ... }
+if identity.InAnyGroup("developers", "ops") { ... }
 ```
 
 Nested groups walked from the client are bounded twice, by
@@ -143,7 +187,7 @@ mux.Handle("GET /private", httpauth.BasicAuth(auth,
     httpauth.WithMinimumDuration(100*time.Millisecond),
 )(handler))
 
-principal := httpauth.MustPrincipal(r.Context())
+identity := httpauth.MustIdentity(r.Context())
 ```
 
 The signature is `func(http.Handler) http.Handler`, so it drops into chi,
@@ -151,7 +195,7 @@ gorilla/mux, or a bare `ServeMux` unchanged. Gin, Echo, and Fiber get the
 same API from their own modules, over the same shared policy, so behaviour
 cannot drift between them.
 
-`LoginHandler` reads JSON or form credentials and hands you the principal.
+`LoginHandler` reads JSON or form credentials and hands you the identity.
 It issues no session and no token, on purpose.
 
 The status mapping is the whole of the error handling most callers need:
@@ -176,10 +220,39 @@ answer.
 - **Plaintext is refused** unless StartTLS is configured or
   `WithInsecureNoTLS` is passed explicitly.
 - **No password is logged**, ever, and none is stored: the cache key is an
-  HMAC under a per-process random key.
+  HMAC under a random key, and a `Cache` implementation never sees a
+  credential.
 
-Each of these has a test named after what it protects, and the escaping has
-fuzz targets that assert the property rather than the output.
+Each of these has a test named after what it protects. Ten fuzz targets
+assert the properties rather than the outputs — including two that drive
+the whole package end to end against a directory that parses filters and
+DNs for real, and require that no username, however constructed,
+authenticates as somebody it is not.
+
+## Several replicas
+
+Nothing is shared between processes unless you share it: each replica has
+its own pool, its own failover state, and its own cache.
+
+To share a cache, give every replica the same secret and a store that
+points at the same place. Without the shared secret each replica derives a
+different key for the same login, and the shared cache silently never hits:
+
+```go
+ldapauth.WithCache(30*time.Second),
+ldapauth.WithCacheSecret(secretFromYourSecretManager),
+ldapauth.WithCacheStore(redisCache{client}),   // your ~40 lines
+```
+
+Two more things matter at fleet scale. Retry backoff is fully jittered, so
+a fleet that lost its directory at the same instant does not come back at
+the same instant. And `FailoverInOrder`, the default, sends every replica
+to the same server first — usually what you want, and `FailoverRandom` is
+there for when it is not.
+
+Within one process, identical logins arriving at the same time are
+collapsed into a single round trip, which is the part of a stampede a cache
+cannot absorb: the cache only helps once the first attempt has finished.
 
 ## Testing without a directory
 
@@ -230,9 +303,10 @@ Against the in-memory directory, so these measure the overhead this library
 adds on top of a round trip rather than how fast your server is:
 
 ```
-BenchmarkDirectBind                1456 ns/op    1141 B/op    14 allocs/op
-BenchmarkSearchThenBind            4788 ns/op    2632 B/op    42 allocs/op
-BenchmarkSearchThenBindWithGroups  5872 ns/op    2709 B/op    58 allocs/op
+BenchmarkDirectBind                1542 ns/op    1034 B/op    14 allocs/op
+BenchmarkSearchThenBind            4191 ns/op    2559 B/op    42 allocs/op
+BenchmarkSearchThenBindWithGroups  5396 ns/op    2639 B/op    60 allocs/op
+BenchmarkCachedAuthentication      1535 ns/op     952 B/op    15 allocs/op
 ```
 
 A real directory answers a bind in single-digit milliseconds, so the
@@ -242,32 +316,98 @@ them is visible, not so that they can be quoted.
 
 ## Examples
 
+Every one of them runs with no LDAP server installed — they use the
+in-memory directory from `ldaptest` — except where a real URL is a flag.
+
+**Getting started**
+
 | | |
 |---|---|
 | [`examples/basic`](examples/basic) | direct bind, one login |
 | [`examples/search-then-bind`](examples/search-then-bind) | service account, pool, health check |
 | [`examples/groups`](examples/groups) | all three group sources side by side |
-| [`examples/mtls`](examples/mtls) | client certificates and TLS 1.3 |
-| [`examples/nethttp`](examples/nethttp) | an HTTP server that runs with no directory |
 | [`examples/testing`](examples/testing) | what a login does, printed step by step |
-| [`contrib/*/example`](contrib) | Gin, Echo, and Fiber, each runnable as-is |
+
+**Security**
+
+| | |
+|---|---|
+| [`examples/escaping`](examples/escaping) | injection, the usual fix, and what this package does instead |
+| [`examples/mtls`](examples/mtls) | client certificates and TLS 1.3 |
+
+**Serving HTTP**
+
+| | |
+|---|---|
+| [`examples/nethttp`](examples/nethttp) | an HTTP server that runs with no directory |
+| [`examples/lookup`](examples/lookup) | behind an authenticating proxy, with no password |
+| [`contrib/gin/example`](contrib/gin/example) · [`echo`](contrib/echo/example) · [`fiber`](contrib/fiber/example) | the same server, per framework |
+
+**Replacing a seam**
+
+| | |
+|---|---|
+| [`examples/custom-identity`](examples/custom-identity) | your own user type, from `PrincipalMapper` |
+| [`examples/custom-groups`](examples/custom-groups) | groups from an entitlements service, plus the directory's |
+| [`examples/cache-store`](examples/cache-store) | a cache shared between replicas |
+| [`examples/metrics`](examples/metrics) | a metrics adapter, with no metrics library |
+
+**Operations**
+
+| | |
+|---|---|
+| [`examples/failover`](examples/failover) | a replica going away, and coming back |
 
 ## Documentation
 
-- [docs/design.md](docs/design.md) — how the layers fit, and what each one refuses to do
-- [docs/security.md](docs/security.md) — the invariants, and the attacks behind them
+**Start here**
+
 - [docs/strategies.md](docs/strategies.md) — choosing and configuring a bind strategy
 - [docs/groups.md](docs/groups.md) — the three sources, nesting, and what each costs
-- [docs/production.md](docs/production.md) — timeouts, pools, failover, and what to alert on
+- [docs/http.md](docs/http.md) — middleware, login handlers, status codes, sessions
+- [docs/directories.md](docs/directories.md) — what to configure for AD, OpenLDAP, 389ds, FreeIPA
+
+**Reference**
+
+- [docs/configuration.md](docs/configuration.md) — every option, its default, and the thing worth knowing
+- [docs/extending.md](docs/extending.md) — the interfaces, and how to replace one
+- [docs/testing.md](docs/testing.md) — the in-memory directory, the integration suite, the fuzz targets
+
+**Operating it**
+
+- [docs/production.md](docs/production.md) — timeouts, pools, failover, replicas, and what to alert on
 - [docs/troubleshooting.md](docs/troubleshooting.md) — the errors you will actually see
-- [docs/testing.md](docs/testing.md) — the in-memory directory and the integration suite
+
+**Understanding it**
+
+- [docs/design.md](docs/design.md) — how the layers fit, and what each one refuses to do
+- [docs/security.md](docs/security.md) — the invariants, and the attacks behind them
+
+**Per module**
+
+- [contrib/gin/README.md](contrib/gin/README.md) · [contrib/echo/README.md](contrib/echo/README.md) · [contrib/fiber/README.md](contrib/fiber/README.md)
 
 ## Status
 
-Pre-1.0. The API is settled enough to build on and the invariants are not
-going to move, but a minor version may still break a signature — see
-[CHANGELOG.md](CHANGELOG.md), where anything that does is listed under
-`### Breaking`.
+1.0. The exported API is stable: it will not break before 2.0, and
+`api_test.go` mirrors every exported signature so that a change to one
+cannot happen quietly.
+
+What CI proves on every push: the tests pass under the race detector on
+Linux, macOS, and Windows, for the root module and all three contrib
+modules, on both the oldest toolchain the `go` directive allows and the
+newest; the root module and the Gin and Echo adapters compile for sixteen
+GOOS/GOARCH pairs, and the Fiber one for fourteen — fasthttp has no wasm
+listener; the root module still has exactly one direct dependency; every
+exported declaration has a doc comment and every documentation link
+resolves; coverage is above its floor; all ten fuzz targets run; the
+workflows lint; and the integration suite passes against a real OpenLDAP.
+
+Every action is pinned by commit SHA, every job has a timeout and the
+least privilege it can do its work with, and no checkout leaves a
+credential behind. CodeQL and OpenSSF Scorecard run alongside.
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 

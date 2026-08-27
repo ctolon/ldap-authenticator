@@ -22,7 +22,7 @@ const (
 	devsDN   = "cn=devs,ou=groups,dc=example,dc=com"
 )
 
-func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Authenticator {
+func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Client {
 	t.Helper()
 
 	dir := ldaptest.New(
@@ -49,13 +49,13 @@ func newAuth(t *testing.T, opts ...ldapauth.Option) *ldapauth.Authenticator {
 	return auth
 }
 
-func newApp(t *testing.T, auth *ldapauth.Authenticator, opts ...httpauth.Option) *fiber.App {
+func newApp(t *testing.T, auth *ldapauth.Client, opts ...httpauth.Option) *fiber.App {
 	t.Helper()
 
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	app.Use(ldapauthfiber.BasicAuth(auth, opts...))
 	app.Get("/private", func(c *fiber.Ctx) error {
-		return c.SendString(ldapauthfiber.MustPrincipal(c).Username)
+		return c.SendString(ldapauthfiber.MustIdentity(c).GetUsername())
 	})
 
 	return app
@@ -164,8 +164,8 @@ func TestLoginHandler(t *testing.T) {
 
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	app.Post("/login", ldapauthfiber.LoginHandler(newAuth(t),
-		func(c *fiber.Ctx, p *ldapauth.Principal) error {
-			return c.SendString(p.DN)
+		func(c *fiber.Ctx, identity ldapauth.Identity) error {
+			return c.SendString(identity.GetDN())
 		},
 	))
 
@@ -185,8 +185,8 @@ func TestLoginHandlerAcceptsAForm(t *testing.T) {
 
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	app.Post("/login", ldapauthfiber.LoginHandler(newAuth(t),
-		func(c *fiber.Ctx, p *ldapauth.Principal) error {
-			return c.SendString(p.Username)
+		func(c *fiber.Ctx, identity ldapauth.Identity) error {
+			return c.SendString(identity.GetUsername())
 		},
 	))
 

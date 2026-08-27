@@ -420,7 +420,7 @@ func WithUserSearchScope(scope int) Option {
 // user search is an alias that can redirect an authentication.
 func WithDerefAliases(deref int) Option {
 	return func(c *config) error {
-		if deref < 0 || deref > 3 {
+		if !derefValid(deref) {
 			return fmt.Errorf("%w: %d is not a valid alias dereferencing mode", ErrInvalidOption, deref)
 		}
 
@@ -938,6 +938,67 @@ func WithNegativeCache(ttl time.Duration) Option {
 	}
 }
 
+// WithCacheStore replaces the in-memory cache with an implementation of
+// your own, which is how several replicas share one.
+//
+//	ldapauth.WithCache(30*time.Second),
+//	ldapauth.WithCacheSecret(secretFromYourSecretManager),
+//	ldapauth.WithCacheStore(redisCache{client}),
+//
+// A shared cache needs a shared secret as well. Keys are derived from the
+// credential by HMAC under the authenticator's secret, and the default
+// secret is drawn from the system CSPRNG at startup — so without
+// [WithCacheSecret] every replica derives a different key for the same
+// login and the shared cache never hits.
+//
+// The store never sees a credential: it is handed an opaque key, the
+// username, and the outcome. What it must not do is outlive the trust
+// boundary the outcome was decided in — a cache shared between two
+// services is a cache in which one service's authentication decisions
+// become the other's.
+//
+// Caching must be turned on with [WithCache] as well; a store with no TTL
+// configured is a configuration error rather than an implicit default.
+func WithCacheStore(store Cache) Option {
+	return func(c *config) error {
+		if store == nil {
+			return fmt.Errorf("%w: WithCacheStore was given a nil store", ErrInvalidOption)
+		}
+
+		c.cacheStore = store
+
+		return nil
+	}
+}
+
+// WithCacheSecret sets the key that turns a credential into a cache key,
+// so that several replicas derive the same key for the same login.
+//
+// Without it the secret is drawn from the system CSPRNG when the
+// authenticator is built, which is what you want for a single process: the
+// key is unrelated between runs and worthless outside the one that made
+// it. Set this only when a cache is genuinely shared, and treat the value
+// as a secret — anybody holding it can test a guessed credential against
+// the cache offline.
+//
+// At least 16 bytes; 32 is the size the package generates.
+func WithCacheSecret(secret []byte) Option {
+	return func(c *config) error {
+		const minimum = 16
+
+		if len(secret) < minimum {
+			return fmt.Errorf(
+				"%w: cache secret is %d bytes, want at least %d",
+				ErrInvalidOption, len(secret), minimum,
+			)
+		}
+
+		c.cacheSecret = append([]byte(nil), secret...)
+
+		return nil
+	}
+}
+
 // WithCacheSize bounds the number of cached entries. When the bound is
 // reached the oldest entries are dropped.
 func WithCacheSize(entries int) Option {
@@ -968,6 +1029,24 @@ func WithUsernameMaxLength(n int) Option {
 	}
 }
 
+// WithPasswordMaxLength rejects passwords longer than n before any network
+// call. The default is DefaultPasswordMaxLength.
+//
+// It is not about password strength. It is about not carrying a megabyte
+// from a request body to a directory, once per request, for as long as
+// somebody cares to send one.
+func WithPasswordMaxLength(n int) Option {
+	return func(c *config) error {
+		if n < 1 {
+			return fmt.Errorf("%w: password max length %d is below 1", ErrInvalidOption, n)
+		}
+
+		c.passwordMaxLength = n
+
+		return nil
+	}
+}
+
 // WithCaseFoldUsername lower-cases the username before it is used as a
 // cache key, so that "Alice" and "alice" share one entry on a directory
 // that matches case-insensitively — which is most of them.
@@ -990,6 +1069,63 @@ func WithCaseFoldUsername() Option {
 func WithUsernameRedaction() Option {
 	return func(c *config) error {
 		c.redactUsername = true
+
+		return nil
+	}
+}
+
+// ---- pluggable behaviour ---------------------------------------------------
+
+// WithPrincipalMapper replaces the mapping from a completed authentication
+// to an [Identity].
+//
+// Use it to produce your application's own user type, or to enrich the
+// [Principal] this package ships with something the directory does not
+// know. The mapper runs inside the caller's context and inside the retry
+// loop, so it should be quick and it must be safe to run twice.
+//
+// [Mapping.Entry] is the directory entry, and it is nil unless the
+// configuration asked for something to be read from it. A mapper that
+// wants an attribute has to say so with [WithAttributes], the same as
+// anything else — the entry is not fetched speculatively, because a round
+// trip nobody needs is a round trip on every login.
+//
+//	ldapauth.WithPrincipalMapper(ldapauth.PrincipalMapperFunc(
+//	    func(m ldapauth.Mapping) (ldapauth.Identity, error) {
+//	        return &user{dn: m.DN, name: m.Username, groups: m.Groups}, nil
+//	    },
+//	))
+func WithPrincipalMapper(mapper PrincipalMapper) Option {
+	return func(c *config) error {
+		if mapper == nil {
+			return fmt.Errorf("%w: WithPrincipalMapper was given a nil mapper", ErrInvalidOption)
+		}
+
+		c.mapper = mapper
+
+		return nil
+	}
+}
+
+// WithGroupResolver replaces group resolution entirely.
+//
+// The default resolves groups from the directory in whichever of the three
+// ways the group options asked for. Replace it when membership lives
+// somewhere the directory is not, or when your directory has a group
+// scheme this package does not model. The resolver is handed a [Searcher]
+// so that it can still ask the directory, on the authenticator's
+// connection and with the authenticator's identity.
+//
+// It replaces the built-in resolution rather than adding to it: the group
+// source options are not consulted, so a resolver that wants both should
+// compose the directory's answer with its own.
+func WithGroupResolver(resolver GroupResolver) Option {
+	return func(c *config) error {
+		if resolver == nil {
+			return fmt.Errorf("%w: WithGroupResolver was given a nil resolver", ErrInvalidOption)
+		}
+
+		c.groupResolver = resolver
 
 		return nil
 	}

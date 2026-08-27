@@ -66,11 +66,11 @@ func main() {
 	}
 
 	for _, attempt := range attempts {
-		principal, err := auth.Authenticate(context.Background(), attempt.username, attempt.password)
+		identity, err := auth.Authenticate(context.Background(), attempt.username, attempt.password)
 
 		switch {
 		case err == nil:
-			fmt.Printf("%-12q %-40s groups=%v\n", attempt.username, attempt.expect, principal.Groups)
+			fmt.Printf("%-12q %-40s groups=%v\n", attempt.username, attempt.expect, identity.GetGroups())
 		case errors.Is(err, ldapauth.ErrInvalidCredentials), errors.Is(err, ldapauth.ErrEmptyPassword):
 			fmt.Printf("%-12q %-40s (%v)\n", attempt.username, attempt.expect, err)
 		default:

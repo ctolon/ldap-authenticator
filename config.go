@@ -101,6 +101,11 @@ const (
 	// request is rejected unread.
 	DefaultUsernameMaxLength = 256
 
+	// DefaultPasswordMaxLength is the longest password accepted before the
+	// request is rejected unread. Directories store hashes of bounded
+	// inputs; a megabyte arriving in a password field is not a login.
+	DefaultPasswordMaxLength = 1024
+
 	// DefaultNestedGroupDepth bounds recursive group expansion.
 	DefaultNestedGroupDepth = 4
 
@@ -133,6 +138,8 @@ const (
 	GroupsFromSearch
 )
 
+// String returns a stable, lower-case name for the source, suitable for
+// a log field or a metrics label.
 func (g GroupSource) String() string {
 	switch g {
 	case GroupsDisabled:
@@ -254,6 +261,14 @@ type config struct {
 
 	cacheEnabled bool
 
+	// cacheStore replaces the in-memory cache; see WithCacheStore.
+	cacheStore Cache
+
+	// cacheSecret keys the credential hash. Empty means "generate a
+	// per-process one", which is the default and the safe answer for a
+	// single process.
+	cacheSecret []byte
+
 	cacheTTL time.Duration
 
 	cacheNegativeTTL time.Duration
@@ -262,6 +277,8 @@ type config struct {
 
 	usernameMaxLength int
 
+	passwordMaxLength int
+
 	caseFoldUsername bool
 
 	redactUsername bool
@@ -269,6 +286,12 @@ type config struct {
 	logger *slog.Logger
 
 	metrics Metrics
+
+	// mapper and groupResolver are nil unless the caller replaced them,
+	// in which case New substitutes the package's own.
+	mapper PrincipalMapper
+
+	groupResolver GroupResolver
 
 	backoff backoff.Policy
 
@@ -302,6 +325,7 @@ func defaultConfig() *config {
 		cacheNegativeTTL:   DefaultNegativeCacheTTL,
 		cacheMaxEntries:    DefaultCacheMaxEntries,
 		usernameMaxLength:  DefaultUsernameMaxLength,
+		passwordMaxLength:  DefaultPasswordMaxLength,
 		logger:             discardLogger,
 		metrics:            NoopMetrics{},
 		retryMaxAttempts:   DefaultRetryMaxAttempts,
@@ -315,12 +339,40 @@ func defaultConfig() *config {
 	}
 }
 
+// searchTimeLimit is the server-side time limit, in seconds, derived from
+// the operation timeout. Rounding up by a second keeps the server's own
+// limit from firing just before the client's and turning a clean timeout
+// into a race.
+func (c *config) searchTimeLimit() int {
+	if c.operationTimeout <= 0 {
+		return 0
+	}
+
+	return int(c.operationTimeout.Seconds()) + 1
+}
+
 // searchesDirectory reports whether the configuration ever needs a
 // connection that is not the user's own — for the user search, for a
 // group search, or for an attribute lookup after a direct bind. When it
 // does not, the pool is never built.
 func (c *config) searchesDirectory() bool {
-	return !c.userFilter.isZero() || c.groupSource != GroupsDisabled || c.userBaseDN != "" && len(c.attributeList()) > 0
+	switch {
+	case !c.userFilter.isZero():
+		return true
+	case c.groupSource != GroupsDisabled:
+		return true
+
+	// A replaced group resolver is handed a Searcher, and there is no way
+	// to know from here whether it will use it. Build the pool if a
+	// service account was configured: the cost of an unused pool is a
+	// little memory, and the cost of not building one is that the
+	// resolver silently searches with the user's own permissions.
+	case c.groupResolver != nil:
+		return true
+
+	default:
+		return c.userBaseDN != "" && len(c.attributeList()) > 0
+	}
 }
 
 // directBind reports which strategy is configured.
@@ -548,8 +600,19 @@ func (c *config) validateLimits() error {
 		return fmt.Errorf("%w: username max length %d is below 1", ErrInvalidOption, c.usernameMaxLength)
 	}
 
+	if c.passwordMaxLength < 1 {
+		return fmt.Errorf("%w: password max length %d is below 1", ErrInvalidOption, c.passwordMaxLength)
+	}
+
 	if c.retryMaxAttempts < 0 {
 		return fmt.Errorf("%w: retry max attempts %d is negative", ErrInvalidOption, c.retryMaxAttempts)
+	}
+
+	if !c.cacheEnabled && (c.cacheStore != nil || len(c.cacheSecret) > 0) {
+		return fmt.Errorf(
+			"%w: a cache store or secret is configured but caching is off; WithCache turns it on",
+			ErrInvalidOption,
+		)
 	}
 
 	if c.cacheEnabled {
@@ -572,6 +635,17 @@ func (c *config) validateLimits() error {
 	return nil
 }
 
+// scopeValid and derefValid ask go-ldap which values it knows, rather than
+// listing them again here. A value the client cannot name is a value the
+// server will not be sent.
 func scopeValid(scope int) bool {
-	return scope == ScopeBaseObject || scope == ScopeSingleLevel || scope == ScopeWholeSubtree
+	_, ok := ldap.ScopeMap[scope]
+
+	return ok
+}
+
+func derefValid(deref int) bool {
+	_, ok := ldap.DerefMap[deref]
+
+	return ok
 }

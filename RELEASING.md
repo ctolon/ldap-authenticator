@@ -2,6 +2,31 @@
 
 The branch model is `dev` → `main`. The tag is the release.
 
+## Before the first one
+
+The repository settings the workflows assume do not live in a file, which
+is why they live in a script:
+
+```sh
+scripts/github-setup.sh            # show what would change
+scripts/github-setup.sh --apply    # change it
+```
+
+It turns on secret scanning and push protection, enables private
+vulnerability reporting — which is where `SECURITY.md` sends people, and a
+security policy with nowhere to report to produces public issues describing
+vulnerabilities — enables Dependabot alerts, protects `main` behind the
+`ci-green` check, and sets the default workflow token to read-only.
+
+Then, once and by hand:
+
+- Enable GitHub Actions if the organisation defaults to off.
+- Check that the `ci-green` check name appears in the branch protection
+  rule after the first workflow run; a required check that has never run is
+  a required check GitHub will not enforce.
+- Publish the OpenSSF Scorecard result by running the Security workflow
+  manually, so the badge in the README resolves.
+
 ## The order matters
 
 This repository holds four modules. The three under `contrib/` require the
@@ -11,11 +36,25 @@ pushed**. Doing it the other way round publishes contrib modules that
 cannot be fetched.
 
 ```
-v0.1.0                  root module, and httpauth and ldaptest with it
-contrib/gin/v0.1.0      after the root tag is indexed
-contrib/echo/v0.1.0
-contrib/fiber/v0.1.0
+v1.0.0                  root module, and httpauth and ldaptest with it
+contrib/gin/v1.0.0      after the root tag is indexed
+contrib/echo/v1.0.0
+contrib/fiber/v1.0.0
 ```
+
+## The checklist
+
+Before running the script:
+
+- [ ] `make check` is green, and `make integration` is green.
+- [ ] `CHANGELOG.md` has entries under `## [Unreleased]`, and they say what
+      changed rather than which files did.
+- [ ] `api_test.go` matches the exported surface — it will not compile if
+      it does not.
+- [ ] Anything that broke an exported signature is under `### Breaking`.
+- [ ] The three `contrib/*/go.mod` files require the version about to be
+      tagged.
+- [ ] `go doc -all` reads as a manual for anything you changed.
 
 ## Cutting a release
 
@@ -31,15 +70,15 @@ rotates the changelog, commits, and annotates the tag.
 
 ```sh
 git push origin main
-git push origin v0.1.0
+git push origin v1.0.0
 ```
 
 Then, once <https://proxy.golang.org/github.com/ctolon/ldap-authenticator/@v/list>
 lists the new version:
 
 ```sh
-./scripts/release.sh --contrib 0.1.0
-git push origin contrib/gin/v0.1.0 contrib/echo/v0.1.0 contrib/fiber/v0.1.0
+./scripts/release.sh --contrib 1.0.0
+git push origin contrib/gin/v1.0.0 contrib/echo/v1.0.0 contrib/fiber/v1.0.0
 ```
 
 ## What the workflow checks before publishing

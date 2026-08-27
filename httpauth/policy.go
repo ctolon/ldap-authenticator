@@ -1,21 +1,3 @@
-// Package httpauth turns an [ldapauth.Authenticator] into HTTP
-// authentication: middleware for net/http, a login handler, and the policy
-// core that the Gin, Echo, and Fiber modules under contrib/ are built on.
-//
-// It lives in the root module because it needs nothing outside the
-// standard library, so nothing about it costs the root module its
-// one-dependency promise. The framework modules are separate because they
-// do not: importing this package never puts Gin in your build graph.
-//
-//	mux := http.NewServeMux()
-//	mux.Handle("/private", httpauth.BasicAuth(auth)(privateHandler))
-//
-// Everything a caller might want to vary — the realm, which groups are
-// required, what a rejection looks like on the wire — is an Option. What
-// it deliberately does not do is issue sessions or tokens. Deciding how a
-// successful login becomes a session is the application's decision, and a
-// half-opinionated session layer here would be harder to work around than
-// to write.
 package httpauth
 
 import (
@@ -33,7 +15,7 @@ import (
 // [ldapauth.ErrInvalidCredentials] because the two deserve different
 // answers: a 401 invites the client to try again with other credentials,
 // and a 403 tells it not to bother.
-var ErrForbidden = errors.New("httpauth: principal is not in a required group")
+var ErrForbidden = errors.New("httpauth: identity is not in a required group")
 
 // DefaultRealm is the realm sent in the WWW-Authenticate header when none
 // is configured.
@@ -119,7 +101,7 @@ func WithRealm(realm string) Option {
 //
 // Group membership has to be configured on the authenticator as well —
 // [ldapauth.WithMemberOfGroups] or [ldapauth.WithGroupSearch] — or the
-// principal arrives with no groups and every requirement fails.
+// identity arrives with no groups and every requirement fails.
 func RequireAnyGroup(groups ...string) Option {
 	return func(p *Policy) error {
 		p.anyGroups = append(p.anyGroups, groups...)
@@ -227,14 +209,14 @@ func (p *Policy) Challenge() string {
 // of moving values in and out of that framework's context.
 func (p *Policy) Authenticate(
 	ctx context.Context,
-	auth *ldapauth.Authenticator,
+	auth ldapauth.Authenticator,
 	username, password string,
-) (*ldapauth.Principal, error) {
+) (ldapauth.Identity, error) {
 	started := time.Now()
 
-	principal, err := auth.Authenticate(ctx, username, password)
+	identity, err := auth.Authenticate(ctx, username, password)
 	if err == nil {
-		err = p.authorise(principal)
+		err = p.authorise(identity)
 	}
 
 	p.pad(ctx, started)
@@ -243,16 +225,16 @@ func (p *Policy) Authenticate(
 		return nil, err
 	}
 
-	return principal, nil
+	return identity, nil
 }
 
 // authorise applies the group requirement.
-func (p *Policy) authorise(principal *ldapauth.Principal) error {
-	if len(p.anyGroups) > 0 && !principal.InAnyGroup(p.anyGroups...) {
+func (p *Policy) authorise(identity ldapauth.Identity) error {
+	if len(p.anyGroups) > 0 && !identity.InAnyGroup(p.anyGroups...) {
 		return ErrForbidden
 	}
 
-	if len(p.allGroups) > 0 && !principal.InAllGroups(p.allGroups...) {
+	if len(p.allGroups) > 0 && !identity.InAllGroups(p.allGroups...) {
 		return ErrForbidden
 	}
 
@@ -330,6 +312,7 @@ func Status(err error) int {
 	case errors.Is(err, ldapauth.ErrEmptyUsername),
 		errors.Is(err, ldapauth.ErrEmptyPassword),
 		errors.Is(err, ldapauth.ErrInvalidUsername),
+		errors.Is(err, ldapauth.ErrInvalidPassword),
 		errors.Is(err, ErrMalformedRequest):
 		return http.StatusBadRequest
 

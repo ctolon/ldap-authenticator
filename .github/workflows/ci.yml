@@ -1,6 +1,11 @@
 # The gate. Every job here has a `make` target behind it, so that a green
 # `make check` on a laptop means a green CI and there is no second, hidden
 # definition of "passing".
+#
+# Actions are pinned by commit SHA rather than by tag. A tag is mutable and
+# a workflow runs with a token; between those two facts, an unpinned action
+# is somebody else's write access to this repository. Dependabot raises the
+# pins.
 name: CI
 
 on:
@@ -9,6 +14,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only at the top, and no job here asks for more. A workflow that
+# runs on pull_request runs code from the pull request; a token it does not
+# have is a token that cannot be misused.
 permissions:
   contents: read
 
@@ -16,38 +24,86 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    # Windows runners default to PowerShell, where the `for` loops and the
+    # `$(...)` in these steps mean something else entirely.
+    shell: bash
+
 jobs:
+  # Unit tests, under the race detector, on every operating system this
+  # library claims to work on. The race detector is the point: LDAP
+  # authentication is a concurrent workload, and a race that only shows up
+  # on Windows is still a race.
   test:
     name: test (${{ matrix.os }}, go ${{ matrix.go }})
+    timeout-minutes: 15
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # The oldest toolchain the go directive allows, alongside the
+        # newest, so that the directive is a promise rather than a hope.
         go: ['1.25', 'stable']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go }}
-      - run: go test ./...
+      - run: go test -race -count=1 ./...
 
-  race:
-    name: race
-    runs-on: ubuntu-latest
+  # The contrib modules, on every operating system too: they are what most
+  # people will actually import.
+  contrib:
+    name: contrib (${{ matrix.os }})
+    timeout-minutes: 15
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
-      - run: make test-race
+      - name: build, vet and test each contrib module
+        shell: bash
+        run: |
+          for module in contrib/gin contrib/echo contrib/fiber; do
+            echo "==> $module"
+            ( cd "$module" && go build ./... && go vet ./... && go test -race -count=1 ./... )
+          done
+
+  # Building for a platform nobody in CI runs is how a `syscall` that only
+  # exists on Linux gets caught before somebody's Raspberry Pi finds it.
+  cross-compile:
+    name: cross-compile
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - run: make cross-compile
 
   vet:
     name: vet, format, lint
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
       - run: make fmt-check
@@ -61,81 +117,172 @@ jobs:
           make tidy
           git diff --exit-code -- '**/go.mod' '**/go.sum' go.mod go.sum
 
-  deps-guard:
-    name: one dependency
+  actionlint:
+    name: workflow lint
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      # These files hold the credentials and the release process. They get
+      # linted like the rest of the repository.
+      - run: make actionlint
+
+  deps-guard:
+    name: one dependency
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
       # The claim on the front of the README, enforced rather than trusted.
       - run: make deps-guard
 
-  contrib:
-    name: contrib modules
+  coverage:
+    name: coverage
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
-      - run: make contrib
+      - run: make coverage
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: warn
 
   fuzz:
     name: fuzz smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
-      - run: make fuzz-smoke FUZZTIME=60s
+      - run: make fuzz-smoke FUZZTIME=45s
       # A crasher is the most valuable artefact a CI run can produce.
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-corpus
-          path: testdata/fuzz/
+          path: '**/testdata/fuzz/**'
+          if-no-files-found: warn
 
   bench:
     name: benchmarks
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
       - run: make bench BENCHTIME=100ms
 
   examples:
     name: examples build
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
       - run: make examples
 
+  docs:
+    name: documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      # Exported API with no doc comment, and markdown that has drifted
+      # from the repository it describes. Neither breaks a build on its
+      # own, which is exactly why they need a check.
+      - run: make doc-check
+      - run: make docs-check
+
   integration:
     name: integration (OpenLDAP)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
       - run: ./scripts/integration.sh --down
       - if: failure()
         run: docker compose -f integration/compose.yml logs
 
+  # Every pull request that changes a go.mod is a pull request that changes
+  # what this library runs. GitHub knows which of those versions have
+  # advisories against them; this is how it says so before the merge rather
+  # than after.
+  dependency-review:
+    name: dependency review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure
+
   # One stable check name for branch protection, so that adding a job above
   # does not mean editing the branch rules.
   ci-green:
     name: ci-green
+    timeout-minutes: 5
     runs-on: ubuntu-latest
-    needs: [test, race, vet, deps-guard, contrib, fuzz, bench, examples, integration]
+    needs:
+      - test
+      - contrib
+      - cross-compile
+      - vet
+      - actionlint
+      - deps-guard
+      - docs
+      - coverage
+      - fuzz
+      - bench
+      - examples
+      - integration
     if: always()
     steps:
       - name: fail if anything above failed

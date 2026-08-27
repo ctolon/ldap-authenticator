@@ -41,8 +41,8 @@ func main() {
 
 	e := echo.New()
 
-	e.POST("/login", ldapauthecho.LoginHandler(auth, func(c echo.Context, p *ldapauth.Principal) error {
-		return c.JSON(http.StatusOK, map[string]any{"dn": p.DN, "groups": p.Groups})
+	e.POST("/login", ldapauthecho.LoginHandler(auth, func(c echo.Context, identity ldapauth.Identity) error {
+		return c.JSON(http.StatusOK, map[string]any{"dn": identity.GetDN(), "groups": identity.GetGroups()})
 	}))
 
 	private := e.Group("", ldapauthecho.BasicAuth(auth,
@@ -51,7 +51,7 @@ func main() {
 	))
 
 	private.GET("/me", func(c echo.Context) error {
-		return c.JSON(http.StatusOK, ldapauthecho.MustPrincipal(c))
+		return c.JSON(http.StatusOK, ldapauthecho.MustIdentity(c))
 	})
 
 	e.Logger.Fatal(e.Start(":8080"))

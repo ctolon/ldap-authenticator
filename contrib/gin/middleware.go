@@ -1,17 +1,3 @@
-// Package ldapauthgin is Gin middleware for github.com/ctolon/ldap-authenticator.
-//
-// It is a separate module so that the root package can promise a single
-// dependency and mean it: importing ldapauth never puts Gin in your build
-// graph. The policy — realms, group requirements, status codes, response
-// padding — lives in the httpauth package of the root module and is shared
-// with the other framework adapters, so behaviour cannot drift between
-// them.
-//
-//	r := gin.New()
-//	r.Use(ldapauthgin.BasicAuth(auth, httpauth.RequireAnyGroup("developers")))
-//	r.GET("/me", func(c *gin.Context) {
-//	    c.JSON(200, ldapauthgin.MustPrincipal(c))
-//	})
 package ldapauthgin
 
 import (
@@ -21,9 +7,9 @@ import (
 	"github.com/ctolon/ldap-authenticator/httpauth"
 )
 
-// ContextKey is the key the principal is stored under in the Gin context,
+// ContextKey is the key the identity is stored under in the Gin context,
 // for handlers that would rather use c.Get than the request context.
-const ContextKey = "ldapauth.principal"
+const ContextKey = "ldapauth.identity"
 
 // BasicAuth returns middleware that authenticates every request with HTTP
 // Basic credentials, aborting with 401, 403, or 503 as appropriate and
@@ -31,7 +17,7 @@ const ContextKey = "ldapauth.principal"
 //
 // An option that does not validate panics: middleware is wired at startup,
 // and there is nowhere to return an error to.
-func BasicAuth(auth *ldapauth.Authenticator, opts ...httpauth.Option) gin.HandlerFunc {
+func BasicAuth(auth ldapauth.Authenticator, opts ...httpauth.Option) gin.HandlerFunc {
 	policy, err := httpauth.NewPolicy(opts...)
 	if err != nil {
 		panic(err)
@@ -49,14 +35,14 @@ func BasicAuth(auth *ldapauth.Authenticator, opts ...httpauth.Option) gin.Handle
 			return
 		}
 
-		principal, err := policy.Authenticate(c.Request.Context(), auth, username, password)
+		identity, err := policy.Authenticate(c.Request.Context(), auth, username, password)
 		if err != nil {
 			reject(c, policy, err)
 
 			return
 		}
 
-		store(c, principal)
+		store(c, identity)
 
 		c.Next()
 	}
@@ -69,8 +55,8 @@ func BasicAuth(auth *ldapauth.Authenticator, opts ...httpauth.Option) gin.Handle
 // It issues no session and no token. What a successful login becomes is
 // the application's decision; see the httpauth package for why.
 func LoginHandler(
-	auth *ldapauth.Authenticator,
-	onSuccess func(c *gin.Context, p *ldapauth.Principal),
+	auth ldapauth.Authenticator,
+	onSuccess func(c *gin.Context, p ldapauth.Identity),
 	opts ...httpauth.Option,
 ) gin.HandlerFunc {
 	policy, err := httpauth.NewPolicy(opts...)
@@ -94,47 +80,59 @@ func LoginHandler(
 			return
 		}
 
-		principal, err := policy.Authenticate(c.Request.Context(), auth, username, password)
+		identity, err := policy.Authenticate(c.Request.Context(), auth, username, password)
 		if err != nil {
 			reject(c, policy, err)
 
 			return
 		}
 
-		store(c, principal)
+		store(c, identity)
 
-		onSuccess(c, principal)
+		onSuccess(c, identity)
 	}
 }
 
-// PrincipalFrom returns the principal the middleware authenticated.
-func PrincipalFrom(c *gin.Context) (*ldapauth.Principal, bool) {
+// IdentityFrom returns the identity the middleware authenticated.
+func IdentityFrom(c *gin.Context) (ldapauth.Identity, bool) {
 	if value, ok := c.Get(ContextKey); ok {
-		if p, ok := value.(*ldapauth.Principal); ok {
-			return p, true
+		if identity, ok := value.(ldapauth.Identity); ok {
+			return identity, true
 		}
 	}
 
-	return httpauth.PrincipalFrom(c.Request.Context())
+	return httpauth.IdentityFrom(c.Request.Context())
 }
 
-// MustPrincipal returns the authenticated principal and panics if there is
-// none, for handlers that are only ever mounted behind BasicAuth.
-func MustPrincipal(c *gin.Context) *ldapauth.Principal {
-	p, ok := PrincipalFrom(c)
+// PrincipalFrom returns the identity as the concrete
+// [ldapauth.Principal], for the common case where the mapper was not
+// replaced and reading fields is nicer than calling accessors.
+func PrincipalFrom(c *gin.Context) (*ldapauth.Principal, bool) {
+	identity, ok := IdentityFrom(c)
 	if !ok {
-		panic("ldapauthgin: no principal in context; the handler is not behind BasicAuth")
+		return nil, false
 	}
 
-	return p
+	return ldapauth.AsPrincipal(identity)
 }
 
-// store puts the principal in both places a Gin handler might look: the
+// MustIdentity returns the authenticated identity and panics if there is
+// none, for handlers that are only ever mounted behind BasicAuth.
+func MustIdentity(c *gin.Context) ldapauth.Identity {
+	identity, ok := IdentityFrom(c)
+	if !ok {
+		panic("ldapauthgin: no identity in context; the handler is not behind BasicAuth")
+	}
+
+	return identity
+}
+
+// store puts the identity in both places a Gin handler might look: the
 // Gin context, and the request context that everything else in the
 // standard library reads.
-func store(c *gin.Context, p *ldapauth.Principal) {
-	c.Set(ContextKey, p)
-	c.Request = c.Request.WithContext(httpauth.WithPrincipal(c.Request.Context(), p))
+func store(c *gin.Context, identity ldapauth.Identity) {
+	c.Set(ContextKey, identity)
+	c.Request = c.Request.WithContext(httpauth.WithIdentity(c.Request.Context(), identity))
 }
 
 func reject(c *gin.Context, policy *httpauth.Policy, err error) {

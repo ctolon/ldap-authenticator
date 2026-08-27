@@ -2,6 +2,8 @@ package ldapauth
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -14,13 +16,48 @@ import (
 	"github.com/go-ldap/ldap/v3"
 )
 
-// An Authenticator verifies credentials against an LDAP directory.
+// An Authenticator verifies credentials against a directory.
+//
+// [New] returns a [*Client], which is the implementation this package
+// ships. This interface exists so that the things built on top of an
+// authenticator — the middleware in httpauth, the framework adapters under
+// contrib, and your own handlers — depend on the behaviour rather than on
+// the type. A test can substitute a fake, and a deployment can wrap the
+// real one in a decorator that adds a circuit breaker, a second directory,
+// or a local account for the break-glass user, without any of them
+// knowing.
+//
+// Every method is safe for concurrent use.
+type Authenticator interface {
+	// Authenticate verifies a username and password.
+	Authenticate(ctx context.Context, username, password string) (Identity, error)
+
+	// Lookup reads an identity without verifying a password.
+	Lookup(ctx context.Context, username string) (Identity, error)
+
+	// HealthCheck reports whether the directory is reachable.
+	HealthCheck(ctx context.Context) error
+
+	// Stats reports current occupancy.
+	Stats(ctx context.Context) Stats
+
+	// InvalidateUser drops an account's cached outcomes.
+	InvalidateUser(ctx context.Context, username string) (int, error)
+
+	// InvalidateAll empties the cache.
+	InvalidateAll(ctx context.Context) (int, error)
+
+	// Close releases the pooled connections.
+	Close() error
+}
+
+// Client is the [Authenticator] this package implements.
 //
 // Build one per directory at startup and share it: it is safe for
 // concurrent use, it owns the connection pool, and constructing one
 // validates the whole configuration. Close it when the process is done
 // with it.
-type Authenticator struct {
+type Client struct {
 	cfg *config
 
 	dialer Dialer
@@ -32,22 +69,45 @@ type Authenticator struct {
 	// no groups needs no second identity.
 	pool *pool
 
-	// cache is nil unless WithCache was given.
-	cache *cache
+	// cache is nil unless WithCache or WithCacheStore was given.
+	cache Cache
 
+	// cacheSecret keys the HMAC that turns a credential into a cache key,
+	// so that no Cache implementation ever sees one.
+	cacheSecret []byte
+
+	// flights collapses concurrent authentications of the same credential.
+	// It is nil when there is no cache, because without one every request
+	// is meant to reach the directory.
+	flights *inflight
+
+	mapper PrincipalMapper
+
+	groups GroupResolver
+
+	// closed is closed by Close, and is what every bounded wait selects on
+	// so that shutting down does not have to wait out a backoff.
 	closed chan struct{}
+
+	// shutdown cancels the contexts of work the authenticator started on
+	// its own behalf, such as warming the pool.
+	shutdown context.CancelFunc
 
 	closeOnce sync.Once
 }
 
-// New builds an Authenticator from the given options.
+// Client implements Authenticator. The assertion is here rather than in a
+// test so that it is checked by every build, including a consumer's.
+var _ Authenticator = (*Client)(nil)
+
+// New builds a Client from the given options.
 //
 // It validates everything it can before returning: the URLs parse, the
 // templates have the placeholders they need, the strategy is one of the
 // two and not both, the numbers are in range, and TLS is either configured
 // or explicitly declined. It does not talk to the directory — a directory
 // that is briefly down should not stop a process from starting. Use
-// HealthCheck for that.
+// [Client.HealthCheck] for that.
 //
 // The minimum useful configuration is a URL and a strategy:
 //
@@ -55,7 +115,7 @@ type Authenticator struct {
 //	    ldapauth.WithURL("ldaps://dc1.corp.example:636"),
 //	    ldapauth.WithDirectBind("uid={{username}},ou=people,dc=corp,dc=example"),
 //	)
-func New(opts ...Option) (*Authenticator, error) {
+func New(opts ...Option) (*Client, error) {
 	cfg := defaultConfig()
 
 	for i, opt := range opts {
@@ -72,11 +132,14 @@ func New(opts ...Option) (*Authenticator, error) {
 		return nil, err
 	}
 
-	a := &Authenticator{
-		cfg:     cfg,
-		dialer:  cfg.dialer,
-		servers: newServerSet(cfg.urls, cfg.failoverPolicy, cfg.failoverCooldown, cfg.now),
-		closed:  make(chan struct{}),
+	ctx, cancel := context.WithCancel(context.Background())
+
+	a := &Client{
+		cfg:      cfg,
+		dialer:   cfg.dialer,
+		servers:  newServerSet(cfg.urls, cfg.failoverPolicy, cfg.failoverCooldown, cfg.now),
+		closed:   make(chan struct{}),
+		shutdown: cancel,
 	}
 
 	if a.dialer == nil {
@@ -95,17 +158,24 @@ func New(opts ...Option) (*Authenticator, error) {
 			// Warming happens in the background, and its failures are the
 			// pool's own business. A directory that is not up yet is a
 			// reason for the first login to fail, not for the process to.
-			go a.pool.warm(context.Background())
+			go a.pool.warm(ctx)
 		}
 	}
 
-	if cfg.cacheEnabled {
-		c, err := newCache(cfg.cacheMaxEntries, cfg.now)
-		if err != nil {
-			return nil, fmt.Errorf("ldapauth: initialising cache: %w", err)
-		}
+	if err := a.initCache(cfg); err != nil {
+		cancel()
 
-		a.cache = c
+		return nil, err
+	}
+
+	a.mapper = cfg.mapper
+	if a.mapper == nil {
+		a.mapper = defaultMapper{cfg: cfg}
+	}
+
+	a.groups = cfg.groupResolver
+	if a.groups == nil {
+		a.groups = &directoryGroups{cfg: cfg}
 	}
 
 	a.info("ldap authenticator ready",
@@ -117,6 +187,37 @@ func New(opts ...Option) (*Authenticator, error) {
 	)
 
 	return a, nil
+}
+
+func (a *Client) initCache(cfg *config) error {
+	if !cfg.cacheEnabled {
+		return nil
+	}
+
+	a.cache = cfg.cacheStore
+	if a.cache == nil {
+		a.cache = NewMemoryCache(cfg.cacheMaxEntries, cfg.now)
+	}
+
+	secret := cfg.cacheSecret
+	if len(secret) == 0 {
+		// A per-process secret is the safe default: two runs of the same
+		// program produce unrelated keys for the same credential, and a
+		// key that escapes is worthless the moment the process restarts.
+		// It also means replicas cannot share a cache, which is what
+		// WithCacheSecret is for.
+		generated, err := randomSecret()
+		if err != nil {
+			return fmt.Errorf("ldapauth: generating a cache secret: %w", err)
+		}
+
+		secret = generated
+	}
+
+	a.cacheSecret = secret
+	a.flights = newInflight()
+
+	return nil
 }
 
 func defaultTLSConfig(cfg *config) *tls.Config {
@@ -154,17 +255,21 @@ func strategyName(cfg *config) string {
 // deadline, WithRequestTimeout supplies one.
 //
 // It is safe to call from many goroutines at once.
-func (a *Authenticator) Authenticate(ctx context.Context, username, password string) (*Principal, error) {
+func (a *Client) Authenticate(ctx context.Context, username, password string) (Identity, error) {
 	started := a.cfg.now()
 
-	p, err := a.authenticate(ctx, username, password)
+	identity, err := a.authenticate(ctx, username, password)
 
 	a.cfg.metrics.AuthAttempt(resultLabel(err), a.cfg.now().Sub(started))
 
-	return p, err
+	if err != nil {
+		return nil, err
+	}
+
+	return identity, nil
 }
 
-func (a *Authenticator) authenticate(ctx context.Context, username, password string) (*Principal, error) {
+func (a *Client) authenticate(ctx context.Context, username, password string) (Identity, error) {
 	if err := a.alive(); err != nil {
 		return nil, err
 	}
@@ -176,8 +281,14 @@ func (a *Authenticator) authenticate(ctx context.Context, username, password str
 	ctx, cancel := a.withTimeout(ctx)
 	defer cancel()
 
-	if p, hit := a.fromCache(username, password); hit {
-		if p == nil {
+	if a.cache == nil {
+		return a.attempt(ctx, username, password)
+	}
+
+	key := a.cacheKey(username, password)
+
+	if identity, hit := a.fromCache(ctx, key); hit {
+		if identity == nil {
 			return nil, &AuthError{
 				Op:       "cache",
 				Username: a.cfg.safeUsername(username),
@@ -185,24 +296,60 @@ func (a *Authenticator) authenticate(ctx context.Context, username, password str
 			}
 		}
 
-		return p, nil
+		return identity, nil
 	}
 
-	var principal *Principal
+	// Everything that reaches the directory goes through here, so that a
+	// burst of identical logins costs one bind rather than one each.
+	//
+	// The work runs under a context detached from this caller's
+	// cancellation but carrying its deadline. Otherwise the first caller
+	// to close their browser would cancel the authentication that a
+	// hundred others are waiting on, and the stampede this exists to
+	// prevent would arrive anyway, one timeout later.
+	work := context.WithoutCancel(ctx)
+
+	if deadline, ok := ctx.Deadline(); ok {
+		var cancelWork context.CancelFunc
+
+		work, cancelWork = context.WithDeadline(work, deadline)
+		defer cancelWork()
+	}
+
+	identity, shared, err := a.flights.do(ctx, key, func() (Identity, error) {
+		identity, err := a.attempt(work, username, password)
+
+		a.remember(work, key, username, identity, err)
+
+		return identity, err
+	})
+
+	if shared {
+		a.cfg.metrics.CacheEvent(CacheCoalesced)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return identity, nil
+}
+
+// attempt is one authentication, retries included, with no caching around
+// it.
+func (a *Client) attempt(ctx context.Context, username, password string) (Identity, error) {
+	var identity Identity
 
 	err := a.withRetry(ctx, "authenticate", func(ctx context.Context) error {
-		p, err := a.once(ctx, username, password)
+		result, err := a.once(ctx, username, password)
 		if err != nil {
 			return err
 		}
 
-		principal = p
+		identity = result
 
 		return nil
 	})
-
-	a.remember(username, password, principal, err)
-
 	if err != nil {
 		a.debug("authentication failed", "username", a.cfg.safeUsername(username), "error", err)
 
@@ -211,16 +358,17 @@ func (a *Authenticator) authenticate(ctx context.Context, username, password str
 
 	a.debug("authentication succeeded",
 		"username", a.cfg.safeUsername(username),
-		"dn", principal.DN,
-		"groups", len(principal.Groups),
+		"dn", identity.GetDN(),
+		"groups", len(identity.GetGroups()),
 	)
 
-	return principal, nil
+	return identity, nil
 }
 
-// once is a single attempt: bind, read, resolve groups. Everything that
-// wraps it — validation, caching, retry, metrics — lives above.
-func (a *Authenticator) once(ctx context.Context, username, password string) (*Principal, error) {
+// once is a single attempt: bind, read, resolve groups, map. Everything
+// that wraps it — validation, caching, coalescing, retry, metrics — lives
+// above.
+func (a *Client) once(ctx context.Context, username, password string) (Identity, error) {
 	var (
 		r   *resolved
 		err error
@@ -238,15 +386,36 @@ func (a *Authenticator) once(ctx context.Context, username, password string) (*P
 
 	defer r.close()
 
-	groups, err := a.resolveGroups(ctx, r, username)
+	return a.finish(ctx, username, r)
+}
+
+// finish turns a completed bind into an Identity: groups, then mapping.
+func (a *Client) finish(ctx context.Context, username string, r *resolved) (Identity, error) {
+	groups, err := a.groups.ResolveGroups(ctx, GroupRequest{
+		Username: username,
+		DN:       r.dn,
+		Entry:    r.entry,
+		Search:   a.searcherFor(r),
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	p := a.cfg.newPrincipal(username, r.dn, r.entry)
-	p.Groups = groups
+	identity, err := a.mapper.MapPrincipal(Mapping{
+		Username: username,
+		DN:       r.dn,
+		Entry:    r.entry,
+		Groups:   groups,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("ldapauth: mapping the principal: %w", err)
+	}
 
-	return p, nil
+	if identity == nil {
+		return nil, fmt.Errorf("%w: the principal mapper returned no identity", ErrInvalidOption)
+	}
+
+	return identity, nil
 }
 
 // Lookup reads a user's entry and groups without verifying a password.
@@ -260,7 +429,7 @@ func (a *Authenticator) once(ctx context.Context, username, password string) (*P
 // Unlike Authenticate, Lookup distinguishes a missing user: it returns
 // ErrUserNotFound. There is no oracle to protect here, since the caller
 // already knows who they are asking about.
-func (a *Authenticator) Lookup(ctx context.Context, username string) (*Principal, error) {
+func (a *Client) Lookup(ctx context.Context, username string) (Identity, error) {
 	if err := a.alive(); err != nil {
 		return nil, err
 	}
@@ -280,7 +449,7 @@ func (a *Authenticator) Lookup(ctx context.Context, username string) (*Principal
 	ctx, cancel := a.withTimeout(ctx)
 	defer cancel()
 
-	var principal *Principal
+	var identity Identity
 
 	err := a.withRetry(ctx, "lookup", func(ctx context.Context) error {
 		r, err := a.lookupOnce(ctx, username)
@@ -290,24 +459,18 @@ func (a *Authenticator) Lookup(ctx context.Context, username string) (*Principal
 
 		defer r.close()
 
-		groups, err := a.resolveGroups(ctx, r, username)
-		if err != nil {
-			return err
-		}
+		identity, err = a.finish(ctx, username, r)
 
-		principal = a.cfg.newPrincipal(username, r.dn, r.entry)
-		principal.Groups = groups
-
-		return nil
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return principal, nil
+	return identity, nil
 }
 
-func (a *Authenticator) lookupOnce(ctx context.Context, username string) (*resolved, error) {
+func (a *Client) lookupOnce(ctx context.Context, username string) (*resolved, error) {
 	if a.cfg.directBind() {
 		dn := a.cfg.bindDN.expand(escapeDNValue, map[string]string{placeholderUsername: username})
 
@@ -315,7 +478,7 @@ func (a *Authenticator) lookupOnce(ctx context.Context, username string) (*resol
 			return a.readEntry(conn, dn)
 		})
 		if err != nil {
-			if resultCode(err) == ldap.LDAPResultNoSuchObject {
+			if ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
 				return nil, fmt.Errorf("%w: %s", ErrUserNotFound, a.cfg.safeUsername(username))
 			}
 
@@ -353,7 +516,7 @@ func (a *Authenticator) lookupOnce(ctx context.Context, username string) (*resol
 //
 // Wire it to a readiness probe, not a liveness probe: a directory that is
 // down is a reason to stop taking traffic, not a reason to restart.
-func (a *Authenticator) HealthCheck(ctx context.Context) error {
+func (a *Client) HealthCheck(ctx context.Context) error {
 	if err := a.alive(); err != nil {
 		return err
 	}
@@ -404,27 +567,31 @@ func (a *Authenticator) HealthCheck(ctx context.Context) error {
 // many it dropped. Call it after changing somebody's password or their
 // group memberships, rather than waiting out the TTL. It is a no-op when
 // caching is off.
-func (a *Authenticator) InvalidateUser(username string) int {
+func (a *Client) InvalidateUser(ctx context.Context, username string) (int, error) {
 	if a.cache == nil {
-		return 0
+		return 0, nil
 	}
 
-	return a.cache.invalidateUser(username)
+	return a.cache.InvalidateUser(ctx, username)
 }
 
 // InvalidateAll empties the cache and reports how many entries it dropped.
-func (a *Authenticator) InvalidateAll() int {
+func (a *Client) InvalidateAll(ctx context.Context) (int, error) {
 	if a.cache == nil {
-		return 0
+		return 0, nil
 	}
 
-	return a.cache.invalidateAll()
+	return a.cache.InvalidateAll(ctx)
 }
 
 // Stats reports the authenticator's current occupancy. It is a snapshot
 // for a metrics scrape or a debug endpoint; nothing in the package
 // branches on it.
-func (a *Authenticator) Stats() Stats {
+//
+// The context is there for the cache, which may live somewhere else. A
+// cache that cannot answer leaves CacheEntries at -1 rather than failing
+// the call: a debug endpoint should not go down because Redis did.
+func (a *Client) Stats(ctx context.Context) Stats {
 	s := Stats{
 		Servers:        len(a.cfg.urls),
 		HealthyServers: a.servers.healthy(),
@@ -435,9 +602,20 @@ func (a *Authenticator) Stats() Stats {
 		s.PoolSize = a.cfg.poolSize
 	}
 
-	if a.cache != nil {
-		s.CacheEntries = a.cache.size()
+	if a.cache == nil {
+		return s
 	}
+
+	entries, err := a.cache.Len(ctx)
+	if err != nil {
+		a.debug("cache could not report its size", "error", err)
+
+		s.CacheEntries = -1
+
+		return s
+	}
+
+	s.CacheEntries = entries
 
 	return s
 }
@@ -445,18 +623,24 @@ func (a *Authenticator) Stats() Stats {
 // Close releases the pooled connections. Calls already in flight are not
 // interrupted; they finish against connections that are closed on release.
 // Close is idempotent, and every method returns ErrClosed afterwards.
-func (a *Authenticator) Close() error {
+func (a *Client) Close() error {
 	var err error
 
 	a.closeOnce.Do(func() {
 		close(a.closed)
+		a.shutdown()
 
 		if a.pool != nil {
 			err = a.pool.close()
 		}
 
 		if a.cache != nil {
-			a.cache.invalidateAll()
+			// Best effort, and deliberately not fatal: a shared cache is
+			// not this process's to empty, and a local one is about to be
+			// garbage anyway.
+			if _, cerr := a.cache.InvalidateAll(context.Background()); cerr != nil {
+				a.debug("cache could not be emptied on close", "error", cerr)
+			}
 		}
 
 		a.info("ldap authenticator closed")
@@ -465,7 +649,7 @@ func (a *Authenticator) Close() error {
 	return err
 }
 
-func (a *Authenticator) alive() error {
+func (a *Client) alive() error {
 	select {
 	case <-a.closed:
 		return ErrClosed
@@ -478,7 +662,7 @@ func (a *Authenticator) alive() error {
 // context already has an earlier deadline. The caller's deadline always
 // wins when it is tighter, because it is the one that knows what the
 // request is for.
-func (a *Authenticator) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+func (a *Client) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if a.cfg.requestTimeout <= 0 {
 		return context.WithCancel(ctx)
 	}
@@ -490,19 +674,37 @@ func (a *Authenticator) withTimeout(ctx context.Context) (context.Context, conte
 	return context.WithTimeout(ctx, a.cfg.requestTimeout)
 }
 
-func (a *Authenticator) fromCache(username, password string) (*Principal, bool) {
-	if a.cache == nil {
+// cacheKey turns a credential into an opaque key.
+//
+// The username is included in the hashed input as well as being stored
+// alongside it, so that two accounts which happen to share a password do
+// not share an entry.
+func (a *Client) cacheKey(username, password string) string {
+	mac := hmac.New(sha256.New, a.cacheSecret)
+	mac.Write([]byte(a.cacheName(username)))
+	mac.Write([]byte{0})
+	mac.Write([]byte(password))
+
+	return string(mac.Sum(nil))
+}
+
+func (a *Client) fromCache(ctx context.Context, key string) (Identity, bool) {
+	identity, hit, err := a.cache.Get(ctx, key)
+	if err != nil {
+		// A cache that is down must not be a directory that is down.
+		a.warn("cache lookup failed; falling through to the directory", "error", err)
+		a.cfg.metrics.CacheEvent(CacheError)
+
 		return nil, false
 	}
 
-	p, hit := a.cache.lookup(a.cacheName(username), password)
 	if !hit {
 		a.cfg.metrics.CacheEvent(CacheMiss)
 
 		return nil, false
 	}
 
-	if p == nil {
+	if identity == nil {
 		a.cfg.metrics.CacheEvent(CacheNegativeHit)
 
 		return nil, true
@@ -510,23 +712,28 @@ func (a *Authenticator) fromCache(username, password string) (*Principal, bool) 
 
 	a.cfg.metrics.CacheEvent(CacheHit)
 
-	return p, true
+	return identity, true
 }
 
 // remember stores an outcome. Only the two outcomes that are about this
 // credential are cached: a success, and a rejection. A connection failure
 // says nothing about whether the password is right, and caching it would
 // serve an outage back to the caller for the length of the TTL.
-func (a *Authenticator) remember(username, password string, p *Principal, err error) {
-	if a.cache == nil {
-		return
-	}
+func (a *Client) remember(ctx context.Context, key, username string, identity Identity, err error) {
+	var cerr error
 
 	switch {
 	case err == nil:
-		a.cache.store(a.cacheName(username), password, p, a.cfg.cacheTTL)
+		cerr = a.cache.Set(ctx, key, username, identity, a.cfg.cacheTTL)
 	case errors.Is(err, ErrInvalidCredentials):
-		a.cache.store(a.cacheName(username), password, nil, a.cfg.cacheNegativeTTL)
+		cerr = a.cache.Set(ctx, key, username, nil, a.cfg.cacheNegativeTTL)
+	default:
+		return
+	}
+
+	if cerr != nil {
+		a.warn("cache write failed", "error", cerr)
+		a.cfg.metrics.CacheEvent(CacheError)
 	}
 }
 
@@ -534,7 +741,7 @@ func (a *Authenticator) remember(username, password string, p *Principal, err er
 // nowhere else is deliberate: the directory decides how usernames compare
 // when it matches them, and this package decides only whether two requests
 // share a cache entry.
-func (a *Authenticator) cacheName(username string) string {
+func (a *Client) cacheName(username string) string {
 	if a.cfg.caseFoldUsername {
 		return strings.ToLower(username)
 	}
@@ -569,6 +776,17 @@ func (c *config) checkCredentials(username, password string) error {
 
 	if password == "" {
 		return ErrEmptyPassword
+	}
+
+	if len(password) > c.passwordMaxLength {
+		// A password longer than any directory will store is not a login
+		// attempt. Refusing it here keeps a megabyte of nonsense from
+		// becoming a megabyte on the wire, once per request, for as long
+		// as somebody cares to send it.
+		return fmt.Errorf(
+			"%w: %d bytes exceeds the %d byte limit",
+			ErrInvalidPassword, len(password), c.passwordMaxLength,
+		)
 	}
 
 	return nil
