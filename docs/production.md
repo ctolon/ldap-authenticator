@@ -38,7 +38,7 @@ Three, and they nest:
 
 | | bounds | default |
 |---|---|---|
-| `WithDialTimeout` | one TCP connect plus TLS handshake | 5s |
+| `WithDialTimeout` | one TCP connect, plus the TLS handshake or StartTLS upgrade | 5s |
 | `WithOperationTimeout` | one LDAP operation on a live connection | 10s |
 | `WithRequestTimeout` | one whole `Authenticate`, retries included | 15s |
 
@@ -49,6 +49,13 @@ the two, because they are the one who knows what the request is for.
 The operation timeout is the one people forget. A server that accepts a
 connection and then stops answering is a real failure mode, and without a
 per-operation limit the only thing bounding it is the caller's context.
+
+The dial timeout covers a StartTLS upgrade as well as the connect, which
+matters more than it sounds: the upgrade is a round trip and then a TLS
+handshake, and neither is bounded by the TCP connect timeout. A server that
+accepts a connection and goes silent during the upgrade is refused at the
+dial timeout and its connection closed, rather than left to something else
+to notice.
 
 Set the request timeout below whatever your HTTP server's write timeout is.
 A login that outlives the response it was for is a goroutine holding a pool
@@ -144,14 +151,21 @@ To share one:
 ```go
 ldapauth.WithCache(30*time.Second),
 ldapauth.WithCacheSecret(secretFromYourSecretManager),
-ldapauth.WithCacheStore(redisCache{client}),
+ldapauth.WithSealedCacheStore(redisStore{client}),
 ```
 
 The secret is what makes the sharing work: without it each replica derives
 a different key for the same login, and the shared cache silently never
-hits — a failure mode with no error and a large bill. See
-[extending.md](extending.md) for what a store looks like, and
-[security.md](security.md) for what the secret is worth to an attacker.
+hits — a failure mode with no error and a large bill.
+
+`WithSealedCacheStore` takes a `ByteStore` — a Get, a Set, and two
+invalidations over `[]byte`, which is what Redis and memcached already are.
+The authenticator serialises the identity and seals it under the same
+secret, and verifies the seal on the way out, so an entry that somebody
+else wrote is a miss rather than an authorisation. Use the older
+`WithCacheStore` only when you need your own encoding; the difference and
+why it matters is in [security.md](security.md). See
+[extending.md](extending.md) for what a store looks like.
 
 Two more things matter at fleet scale:
 
@@ -299,6 +313,38 @@ by the time you call Close, nothing new is choosing it.
 [`examples/reloading`](../examples/reloading) does this under load and
 counts the failures. There are none.
 
+### What the new Client does not inherit
+
+It inherits nothing. A Client's state lives in the Client, so the
+replacement starts with an empty cache, an empty throttle, and — unless you
+passed `WithCacheSecret` — a freshly generated cache secret that makes every
+existing key underivable.
+
+Rotating hourly therefore means an empty cache hourly, and a throttle whose
+count of recent failures resets with it: somebody who can time a rotation
+gets another `WithLockoutProtection` allowance on the far side of it.
+
+So build the replacement from the same option list as the original with only
+the credential changed, and in particular carry these across:
+
+```go
+func optionsWith(password string) []ldapauth.Option {
+    return []ldapauth.Option{
+        // ... everything else, unchanged ...
+        ldapauth.WithCache(30 * time.Second),
+        ldapauth.WithCacheSecret(cacheSecret),          // same secret, every time
+        ldapauth.WithSealedCacheStore(sharedStore),     // same store, every time
+        ldapauth.WithServiceAccount(bindDN, password),  // the only thing that moved
+    }
+}
+```
+
+With a shared store and a fixed secret the cache survives a rotation
+entirely, because the entries were never in the process. The throttle is
+per-process either way; if you rotate often enough for the reset to matter,
+rate limit in front — [`examples/layered`](../examples/layered) shows the
+shape.
+
 ## Cache invalidation across replicas
 
 `InvalidateUser` empties the cache it is given. Which cache that is
@@ -318,8 +364,11 @@ others, short of you building the fan-out.
 
 Two answers, and they are both fine:
 
-- **Share the cache.** `WithCacheStore` plus `WithCacheSecret`, and
-  invalidation is immediate everywhere.
+- **Share the cache.** `WithSealedCacheStore` plus `WithCacheSecret`, and
+  invalidation is immediate everywhere. Prefer the sealed form over
+  `WithCacheStore`: a shared store is a store somebody else can write to,
+  and [security.md](security.md) explains what that buys them if the value
+  is not authenticated.
 - **Keep the TTL short enough that you do not care.** Thirty seconds of a
   disabled account still working is a different conversation from an hour
   of it. `MaxCacheTTL` caps it at five minutes regardless.

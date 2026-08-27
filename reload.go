@@ -71,6 +71,27 @@ func NewReloadable(client *Client) *Reloadable {
 // the secret manager was unreachable, the new password is not live yet —
 // and the right answer to a failed reload is to keep serving with the
 // Client you have, not to install nothing.
+//
+// # What the new Client does not inherit
+//
+// It inherits nothing. A Client's state lives in the Client, so the
+// replacement starts with an empty cache, an empty throttle, and — unless
+// [WithCacheSecret] was given — a freshly generated cache secret, which
+// makes every existing key underivable.
+//
+// Rotating a service-account password every hour therefore means an empty
+// cache every hour, and a throttle whose count of recent failures resets
+// with it: an attacker who can time a rotation gets [WithLockoutProtection]
+// attempts again on the other side of it. Neither is a correctness
+// problem, and both are a surprise if you have not thought about them.
+//
+// Build the replacement from the same option list as the original, with
+// only the credential changed, and carry [WithCacheSecret] and
+// [WithCacheStore] or [WithSealedCacheStore] across every rotation — a
+// shared store plus a fixed secret means the cache survives, since the
+// entries were never in the process. The throttle is per-process either
+// way; if rotations are frequent enough for the reset to matter, rate
+// limit in front, as examples/layered shows.
 func (r *Reloadable) Replace(next *Client) (previous *Client) {
 	if next == nil {
 		panic("ldapauth: Replace was given a nil client")

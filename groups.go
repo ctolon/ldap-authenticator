@@ -59,7 +59,38 @@ type GroupRequest struct {
 //
 // It runs inside the caller's context and inside the retry loop, so it
 // should be quick and it must not have side effects that would be wrong to
-// repeat. An error it returns fails the authentication.
+// repeat.
+//
+// # Failure is closed, and that is a decision
+//
+// An error fails the whole authentication, even though the password was
+// already verified. The alternative — returning the identity with no
+// groups — hands the application a principal that looks like a real login
+// by a user who belongs to nothing, and every RequireAnyGroup check reads
+// that as "not authorised" while every check that only asks whether
+// somebody is logged in reads it as "yes". A group server having a bad
+// afternoon would quietly demote everybody rather than lock them out, and
+// a demotion is much harder to notice than an outage.
+//
+// So the package will not guess. If your deployment would rather degrade
+// than stop — groups are advisory, and the directory is the thing that
+// must stay up — say so explicitly by wrapping the default:
+//
+//	fallible := ldapauth.GroupResolverFunc(
+//		func(ctx context.Context, request ldapauth.GroupRequest) ([]string, error) {
+//			groups, err := inner.ResolveGroups(ctx, request)
+//			if err != nil {
+//				logger.Error("group resolution failed; logging in with none", "err", err)
+//
+//				return nil, nil
+//			}
+//
+//			return groups, nil
+//		},
+//	)
+//
+// Written out like that, the trade is visible in the code that made it,
+// which is where it belongs.
 type GroupResolver interface {
 	// ResolveGroups returns the groups the request's identity belongs to,
 	// as names or as DNs — whichever the rest of the application expects.

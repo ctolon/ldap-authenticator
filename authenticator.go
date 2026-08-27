@@ -215,11 +215,6 @@ func (a *Client) initCache(cfg *config) error {
 		return nil
 	}
 
-	a.cache = cfg.cacheStore
-	if a.cache == nil {
-		a.cache = NewMemoryCache(cfg.cacheMaxEntries, cfg.now)
-	}
-
 	secret := cfg.cacheSecret
 	if len(secret) == 0 {
 		// A per-process secret is the safe default: two runs of the same
@@ -236,6 +231,24 @@ func (a *Client) initCache(cfg *config) error {
 	}
 
 	a.cacheSecret = secret
+
+	switch {
+	case cfg.sealedStore != nil:
+		// Built here rather than by the caller so the seal and the key
+		// derivation cannot end up under different secrets — the one
+		// mistake that would make a shared cache silently never hit.
+		sealed, err := NewSealedCache(cfg.sealedStore, secret)
+		if err != nil {
+			return err
+		}
+
+		a.cache = sealed
+	case cfg.cacheStore != nil:
+		a.cache = cfg.cacheStore
+	default:
+		a.cache = NewMemoryCache(cfg.cacheMaxEntries, cfg.now)
+	}
+
 	a.flights = newInflight()
 
 	return nil
@@ -759,7 +772,12 @@ func (a *Client) cacheKey(username, password string) string {
 	mac.Write([]byte{0})
 	mac.Write([]byte(password))
 
-	return string(mac.Sum(nil))
+	// Hex rather than the raw digest. Redis keys are binary-safe and
+	// memcached keys are not — printable, no spaces, at most 250 bytes —
+	// and the documentation recommends memcached. A key that works
+	// against one store and silently corrupts against another is not an
+	// opaque key, it is a trap.
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // checkThrottle refuses an account this process has seen fail too often

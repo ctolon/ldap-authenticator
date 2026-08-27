@@ -1,5 +1,12 @@
-// Command cache-store implements the Cache interface, which is how several
-// replicas share one cache.
+// Command cache-store implements the Cache interface, the lower-level of
+// the two ways several replicas share one cache.
+//
+// Reach for WithSealedCacheStore first — see examples/sealed-cache. This
+// interface is handed a decoded Identity and is trusted for what it hands
+// back, so nothing binds a value to the key it was written under: anybody
+// who can write to a shared store can write an identity carrying whatever
+// groups they like. Implement Cache when you need your own encoding, and
+// then own that trust deliberately.
 //
 //	go run ./examples/cache-store
 //
@@ -18,7 +25,6 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -63,9 +69,9 @@ func (s *sharedStore) Get(_ context.Context, key string) (ldapauth.Identity, boo
 		return nil, false, errStoreDown
 	}
 
-	// The key is raw HMAC output, not a string that is safe in a URL or a
-	// Redis key — encode it.
-	fmt.Printf("  GET %s…\n", hex.EncodeToString([]byte(key))[:16])
+	// The key is a hex-encoded HMAC: printable, fixed length, and safe as
+	// a Redis or memcached key without any encoding of your own.
+	fmt.Printf("  GET %s…\n", key[:16])
 
 	held, ok := s.entries[key]
 	if !ok || time.Now().After(held.expires) {
@@ -107,8 +113,7 @@ func (s *sharedStore) Set(
 		identity = identity.Clone()
 	}
 
-	fmt.Printf("  SET %s… username=%q %s ttl=%s\n",
-		hex.EncodeToString([]byte(key))[:16], username, outcome, ttl)
+	fmt.Printf("  SET %s… username=%q %s ttl=%s\n", key[:16], username, outcome, ttl)
 
 	s.entries[key] = entry{identity: identity, username: username, expires: time.Now().Add(ttl)}
 

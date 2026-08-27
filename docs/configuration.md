@@ -119,7 +119,8 @@ Off by default. See [production.md](production.md) and
 | `WithCache(ttl)` | off | capped at `MaxCacheTTL`, five minutes |
 | `WithNegativeCache(ttl)` | 5s | stops a stale password reaching a lockout policy |
 | `WithCacheSize(n)` | 4096 | |
-| `WithCacheStore(c)` | in-memory | for a cache shared between replicas |
+| `WithSealedCacheStore(s)` | in-memory | for a cache shared between replicas; values are sealed and verified |
+| `WithCacheStore(c)` | in-memory | the lower-level form; the value is **not** authenticated |
 | `WithCacheSecret(b)` | random per process | required for a shared cache; is itself a credential |
 | `WithCacheUsernameHashing()` | off | the store sees a hash instead of the username |
 

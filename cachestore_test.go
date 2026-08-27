@@ -2,6 +2,8 @@ package ldapauth_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"sync"
@@ -121,8 +123,20 @@ func TestACacheStoreNeverSeesACredential(t *testing.T) {
 	}
 
 	for _, key := range store.seenKeys() {
-		if len(key) != 32 {
-			t.Errorf("key is %d bytes, want a 32-byte HMAC digest", len(key))
+		if len(key) != hex.EncodedLen(sha256.Size) {
+			t.Errorf("key is %d bytes, want a hex-encoded SHA-256 digest", len(key))
+		}
+
+		// memcached keys must be printable ASCII with no spaces, at
+		// most 250 bytes. Redis is binary-safe, but a key that only
+		// works against half the stores we recommend is a trap, so
+		// the encoding is asserted rather than left to chance.
+		for _, r := range key {
+			if r <= ' ' || r > '~' {
+				t.Errorf("key contains %q, which memcached will not accept", r)
+
+				break
+			}
 		}
 
 		for _, secret := range []string{alicePassword, "alice"} {

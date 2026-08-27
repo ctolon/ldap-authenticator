@@ -41,6 +41,7 @@ type publicAPI struct {
 
 	AsPrincipal    func(ldapauth.Identity) (*ldapauth.Principal, bool)
 	NewMemoryCache func(int, func() time.Time) ldapauth.Cache
+	NewSealedCache func(ldapauth.ByteStore, []byte) (ldapauth.Cache, error)
 	ReasonFor      func(error) ldapauth.RejectionReason
 
 	// Reloadable, added in 1.1.
@@ -132,6 +133,7 @@ type publicAPI struct {
 	WithNegativeCache        func(time.Duration) ldapauth.Option
 	WithCacheSize            func(int) ldapauth.Option
 	WithCacheStore           func(ldapauth.Cache) ldapauth.Option
+	WithSealedCacheStore     func(ldapauth.ByteStore) ldapauth.Option
 	WithCacheSecret          func([]byte) ldapauth.Option
 	WithCacheUsernameHashing func() ldapauth.Option
 
@@ -179,6 +181,7 @@ func TestPublicAPIIsStable(t *testing.T) {
 
 		AsPrincipal:    ldapauth.AsPrincipal,
 		NewMemoryCache: ldapauth.NewMemoryCache,
+		NewSealedCache: ldapauth.NewSealedCache,
 		ReasonFor:      ldapauth.ReasonFor,
 
 		NewReloadable:     ldapauth.NewReloadable,
@@ -258,6 +261,7 @@ func TestPublicAPIIsStable(t *testing.T) {
 		WithNegativeCache:        ldapauth.WithNegativeCache,
 		WithCacheSize:            ldapauth.WithCacheSize,
 		WithCacheStore:           ldapauth.WithCacheStore,
+		WithSealedCacheStore:     ldapauth.WithSealedCacheStore,
 		WithCacheSecret:          ldapauth.WithCacheSecret,
 		WithCacheUsernameHashing: ldapauth.WithCacheUsernameHashing,
 

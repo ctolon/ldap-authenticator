@@ -7,6 +7,129 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-27
+
+A review of 1.1 found a resource leak reachable by any server that accepts
+a connection and stops talking, a bug that could hang a request past every
+timeout in the configuration, two that made bounded things unbounded, and a
+gap in what a shared cache can be trusted with. All are fixed, and the
+timing default that made the enumeration guarantee half-true is now on.
+
+### Added
+
+**A shared cache whose values are authenticated.** `WithSealedCacheStore`
+takes a `ByteStore` — a Get, a Set, and two invalidations over `[]byte`,
+which is what Redis and memcached already are. The authenticator
+serialises the identity, seals it with `HMAC-SHA256(secret, key ‖ 0 ‖
+value)`, and verifies that on the way back out.
+
+This closes the write side. `WithCacheStore` is handed a decoded `Identity`
+and believed: the key is an HMAC, so nobody without the secret can address
+a particular login, but nothing at all protects the value — anybody able to
+write to the store could put an identity carrying `cn=domain admins` under
+a key of their choosing, and the login that landed on it was authorised as
+that. A Redis with no auth on a flat network is the normal way that
+happens. A value that fails its seal is now a **miss**: logged, counted
+through `Metrics.CacheEvent` under `CacheError` as the new
+`ErrCacheTampered`, and answered by
+asking the directory. Nothing produces it by accident — alert on it.
+
+It also removes the reason writing a Redis store was work. `ByteStore`
+needs no serialisation and no knowledge of `Identity`. What it does not
+carry is `Principal.Extra` (JSON would hand your type back as a map, so a
+cached login would differ from an uncached one only in production) or a
+custom `Identity` from `WithPrincipalMapper` (the write fails, is counted,
+and the login proceeds uncached). `WithCacheStore` remains for callers who
+need their own encoding, now documented for what it asks you to trust.
+
+`NewSealedCache` is exported for composing caches by hand;
+`WithSealedCacheStore` is the option to reach for, because it builds one
+with the authenticator's own secret and so cannot drift out of step with
+the key derivation. [`examples/sealed-cache`](examples/sealed-cache) runs
+the forgery against both interfaces and prints the difference.
+
+### Fixed
+
+**A wedged StartTLS leaked a goroutine and a socket per attempt.** The
+dial ran go-ldap's context-free `DialURL` on its own goroutine and raced
+the caller's context against it, with the StartTLS upgrade inside that
+goroutine. The caller did come back on time. The goroutine did not: it was
+left blocked in an upgrade that nothing bounds — go-ldap waits for the
+StartTLS response with no deadline unless one was set on the connection
+before the request went out, and then runs the TLS handshake with no
+deadline on the socket at all. `net.Dialer.Timeout` reaches neither; it
+bounds establishing the TCP connection and nothing after it.
+
+So a server that accepted connections and stopped talking — a wedged
+directory, a middlebox, or somebody doing it on purpose — cost three
+goroutines and two open file descriptors per attempt, held until the
+process exited. A regression test now measures both: twenty attempts
+against such a server used to leave sixty goroutines behind and a socket
+the server could still read from five seconds later.
+
+The dial is now two phases. The connection is brought into scope and given
+its deadline before anything is sent, which bounds the wait for the
+StartTLS response; the upgrade is then raced separately, and a context that
+wins closes that known connection rather than abandoning it — which is also
+the only thing that ends a handshake go-ldap is running without a deadline.
+
+**A pooled operation could hang forever.** The service-account bind and the
+health probe issued their LDAP operations directly rather than through the
+package's operation path, so neither carried the caller's deadline: a
+directory that accepted a connection and then stopped answering left
+`Authenticate` blocked past its context, and no timeout in the
+configuration applied. Both now run under the same deadline and
+cancellation handling as every other operation.
+
+Releasing a connection also now resets its deadline to the configured
+operation timeout. A request with a short context used to narrow the
+socket's timeout and leave it narrowed, so the next request to borrow that
+connection inherited a deadline belonging to a request that had already
+finished.
+
+**Response times no longer leak which login failed.** `httpauth` collapses
+every failure into one 401 with one body, which closes the obvious
+enumeration oracle and leaves the timing one wide open: under
+search-then-bind an unknown user costs one round trip and a wrong password
+costs two, and with a cache in front a hit is microseconds against a miss's
+milliseconds. `DefaultMinimumDuration` is now 100ms and applied by default;
+`WithMinimumDuration(0)` opts out, for a deployment already flattening
+response times in front.
+
+**The lockout throttle evicted the wrong entries.** Its bound is on
+distinct usernames, and a repeated failure did not move an entry towards
+the back of the eviction order — so under enough distinct usernames, the
+account being actively guessed at was the one evicted, and its failure
+count reset. A failure now refreshes the entry's position, making eviction
+by last use rather than by first sight.
+
+**The idle floor eroded permanently.** With `WithPoolMinIdle` set but no
+reaper interval configured, the janitor never ran, so connections closed on
+error were never replaced and the pool drifted down to nothing idle. It now
+runs on a one-minute interval whenever a minimum is configured.
+
+**Cache keys are printable.** The key was the raw HMAC digest. Redis keys
+are binary-safe and memcached keys are not — printable ASCII, no spaces, at
+most 250 bytes — and the documentation recommends memcached. Keys are now
+hex. Every key changes, so a shared cache is cold once after upgrading.
+
+### Documentation
+
+- **`Reloadable.Replace` inherits nothing.** A replacement Client starts
+  with an empty cache, an empty throttle, and a fresh random cache secret
+  unless `WithCacheSecret` is carried across — so hourly rotation means an
+  hourly cold cache, and somebody who can time a rotation gets another
+  lockout allowance on the far side of it. `Replace` and
+  [docs/production.md](docs/production.md) now say what to carry across.
+- **Group resolution is fail-closed, and that is a decision.** A failure
+  aborts the login even though the password was verified, because handing
+  the application a principal with no groups turns a group-server outage
+  into a silent demotion of everybody. [docs/groups.md](docs/groups.md)
+  explains it and shows the wrapper that opts into degrading instead.
+- The write-side threat, the seal, and what it does not cover are in
+  [docs/security.md](docs/security.md); both store interfaces are compared
+  in [docs/extending.md](docs/extending.md).
+
 ## [1.1.0] - 2026-08-27
 
 A review of the 1.0 release asked nine questions about running this in an
@@ -278,6 +401,7 @@ generates — and asserting that the wrong CA and the wrong hostname are both
 refused, so that the TLS tests cannot pass the way `InsecureSkipVerify`
 would let them.
 
-[Unreleased]: https://github.com/ctolon/ldap-authenticator/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/ctolon/ldap-authenticator/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/ctolon/ldap-authenticator/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ctolon/ldap-authenticator/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/ctolon/ldap-authenticator/releases/tag/v1.0.0

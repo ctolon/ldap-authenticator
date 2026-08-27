@@ -135,8 +135,20 @@ func (p *pool) take(ctx context.Context) (*pooledConn, error) {
 		}
 
 		if p.cfg.poolHealthCheck {
-			if _, err := conn.WhoAmI(nil); err != nil {
+			err := operate(ctx, p.cfg, conn, func() error {
+				_, werr := conn.WhoAmI(nil)
+
+				return werr
+			})
+			if err != nil {
 				p.discard(conn, "unhealthy")
+
+				// A probe the caller cancelled is not an unhealthy
+				// connection, and trying the next one would ignore the
+				// cancellation just as thoroughly.
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
 
 				continue
 			}
@@ -166,7 +178,9 @@ func (p *pool) open(ctx context.Context) (*pooledConn, error) {
 	p.cfg.metrics.ConnOpened(url)
 
 	if !p.cfg.anonymousService {
-		if err := conn.Bind(p.cfg.serviceDN, p.cfg.servicePassword); err != nil {
+		bind := func() error { return conn.Bind(p.cfg.serviceDN, p.cfg.servicePassword) }
+
+		if err := operate(ctx, p.cfg, conn, bind); err != nil {
 			_ = conn.Close()
 			p.cfg.metrics.ConnClosed("error")
 
@@ -227,6 +241,15 @@ func (p *pool) release(conn *pooledConn, opErr error) {
 	case conn.IsClosing() || !p.usable(conn):
 		p.discard(conn, "expired")
 	default:
+		// The operation timeout is put back before the connection is.
+		//
+		// operate narrows it to whatever the caller had left, and a
+		// connection returned with fifty milliseconds on it carries that
+		// into the next request — whose health probe then fails, or
+		// whose search does. State from one request must not decide the
+		// fate of the next.
+		conn.SetTimeout(p.cfg.operationTimeout)
+
 		conn.idleSince = p.cfg.now()
 
 		p.mu.Lock()
@@ -337,8 +360,19 @@ func (p *pool) janitor() {
 	defer close(p.janitorDone)
 
 	interval := p.reapInterval()
+
+	// With no lifetime and no idle time configured there is nothing to
+	// reap — but there may still be a floor to hold up, and a connection
+	// discarded after an error is a connection below it. Without this the
+	// janitor returned immediately and minIdle eroded permanently, one
+	// failed request at a time, in the one configuration where nobody
+	// would think to look.
 	if interval <= 0 {
-		return
+		if p.cfg.poolMinIdle <= 0 {
+			return
+		}
+
+		interval = time.Minute
 	}
 
 	ticker := time.NewTicker(interval)

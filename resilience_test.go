@@ -1059,3 +1059,143 @@ func TestAnOperationCannotOutliveTheRequestDeadline(t *testing.T) {
 		t.Errorf("the operation ran for %s past a 100ms deadline", elapsed)
 	}
 }
+
+func TestThePoolHonoursTheCallersDeadline(t *testing.T) {
+	t.Parallel()
+
+	// The pool's own operations — the service bind and the health probe —
+	// used to call through to go-ldap directly, so a caller with fifty
+	// milliseconds left could block inside acquire for the full operation
+	// timeout and could not be cancelled at all.
+	dir := newDirectory()
+
+	blocked := make(chan struct{})
+	defer close(blocked)
+
+	dir.BindHook = func(dn, _ string) error {
+		if dn == serviceDN {
+			<-blocked
+		}
+
+		return nil
+	}
+
+	auth := searchAuth(t, dir,
+		ldapauth.WithOperationTimeout(0),
+		ldapauth.WithRequestTimeout(0),
+		ldapauth.WithPoolHealthCheck(false),
+		ldapauth.WithoutRetry(),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+
+	_, err := auth.Authenticate(ctx, "alice", alicePassword)
+	if err == nil {
+		t.Fatal("Authenticate succeeded against a service bind that never returned")
+	}
+
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Errorf("the service bind ran for %s past a 100ms deadline", elapsed)
+	}
+}
+
+func TestTheHealthProbeHonoursTheCallersDeadline(t *testing.T) {
+	t.Parallel()
+
+	dir := newDirectory()
+
+	blocked := make(chan struct{})
+	defer close(blocked)
+
+	var probes atomic.Int64
+
+	dir.SearchHook = func(*ldap.SearchRequest) error { return nil }
+
+	auth := searchAuth(t, dir,
+		ldapauth.WithOperationTimeout(0),
+		ldapauth.WithRequestTimeout(0),
+		ldapauth.WithPoolHealthCheck(true),
+		ldapauth.WithoutRetry(),
+	)
+
+	// Warm one connection so the next acquire takes the probe path.
+	if _, err := auth.Authenticate(testContext(t), "alice", alicePassword); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	dir.BindHook = func(dn, _ string) error {
+		if dn == serviceDN {
+			probes.Add(1)
+			<-blocked
+		}
+
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+
+	_, _ = auth.Authenticate(ctx, "alice", alicePassword)
+
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Errorf("acquire ran for %s past a 100ms deadline", elapsed)
+	}
+}
+
+func TestAConnectionDoesNotCarryOneRequestsDeadlineIntoTheNext(t *testing.T) {
+	t.Parallel()
+
+	// operate narrows the connection's timeout to whatever the caller had
+	// left. A connection returned to the pool still carrying fifty
+	// milliseconds would fail the next request's search for reasons
+	// belonging to a request that already finished.
+	dir := newDirectory()
+
+	var timeouts []time.Duration
+
+	var mu sync.Mutex
+
+	dir.TimeoutHook = func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		timeouts = append(timeouts, d)
+	}
+
+	auth := searchAuth(t, dir,
+		ldapauth.WithOperationTimeout(10*time.Second),
+		ldapauth.WithPoolHealthCheck(false),
+		ldapauth.WithoutRetry(),
+	)
+
+	// A request with a tight deadline narrows the connection.
+	tight, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	if _, err := auth.Authenticate(tight, "alice", alicePassword); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	mu.Lock()
+	timeouts = nil
+	mu.Unlock()
+
+	// The next one, with no deadline of its own, must not inherit it.
+	if _, err := auth.Authenticate(context.Background(), "alice", alicePassword); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	for _, d := range timeouts {
+		if d > 0 && d < time.Second {
+			t.Errorf("a connection carried a %s timeout into a request that set none", d)
+		}
+	}
+}

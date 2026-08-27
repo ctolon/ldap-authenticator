@@ -48,7 +48,8 @@ costs a dependency.
 | `Identity` | what `Authenticate` returns | your application's own user type |
 | `PrincipalMapper` | how an entry becomes an identity | `WithPrincipalMapper` |
 | `GroupResolver` | where groups come from | `WithGroupResolver` |
-| `Cache` | where outcomes are remembered | `WithCacheStore` |
+| `ByteStore` | where outcomes are remembered, over bytes | `WithSealedCacheStore` |
+| `Cache` | the same, over decoded identities | `WithCacheStore` |
 | `Dialer` | where connections come from | `WithDialer` |
 | `Metrics` | where the numbers go | `WithMetrics` |
 
@@ -243,8 +244,15 @@ different key for the same login, and the shared cache silently never hits:
 ```go
 ldapauth.WithCache(30*time.Second),
 ldapauth.WithCacheSecret(secretFromYourSecretManager),
-ldapauth.WithCacheStore(redisCache{client}),   // your ~40 lines
+ldapauth.WithSealedCacheStore(redisStore{client}),   // your ~40 lines
 ```
+
+A `ByteStore` is a Get, a Set, and two invalidations over `[]byte` — which
+is what Redis and memcached already are. The authenticator does the
+serialising, seals the value under the same secret that derives the key,
+and verifies the seal on the way back, so a shared store is somewhere to
+put bytes and never a source of authorisation. That matters because a
+shared store is a store somebody else may be able to write to.
 
 Two more things matter at fleet scale. Retry backoff is fully jittered, so
 a fleet that lost its directory at the same instant does not come back at
@@ -351,7 +359,8 @@ in-memory directory from `ldaptest` — except where a real URL is a flag.
 |---|---|
 | [`examples/custom-identity`](examples/custom-identity) | your own user type, from `PrincipalMapper` |
 | [`examples/custom-groups`](examples/custom-groups) | groups from an entitlements service, plus the directory's |
-| [`examples/cache-store`](examples/cache-store) | a cache shared between replicas |
+| [`examples/sealed-cache`](examples/sealed-cache) | a cache shared between replicas, with the values authenticated |
+| [`examples/cache-store`](examples/cache-store) | the lower-level `Cache` interface, when you need your own encoding |
 | [`examples/metrics`](examples/metrics) | a metrics adapter, with no metrics library |
 
 **Operations**

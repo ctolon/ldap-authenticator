@@ -83,26 +83,78 @@ type netDialer struct {
 // DialContext implements Dialer.
 //
 // go-ldap's DialURL predates context and takes none, so the dial runs on
-// its own goroutine and the context is honoured by racing it. The StartTLS
-// upgrade runs on that goroutine too: it is another round trip to the same
-// server before anything useful can be sent, and leaving it outside the
-// race would mean a connection that hangs during the handshake ignores the
-// caller's deadline entirely.
+// its own goroutine and the context is honoured by racing it. When the
+// context wins that race the goroutine is left to finish and close
+// whatever it opened — abandoning a connection beats leaking a file
+// descriptor, and the net.Dialer's own timeout bounds how long it can
+// live, because until the TCP connection is up that timeout is the only
+// thing happening.
 //
-// When the context wins, the goroutine is left to finish and close
-// whatever it opened: abandoning a connection is preferable to leaking a
-// file descriptor, and the net.Dialer's own timeout bounds how long that
-// goroutine can live.
+// A StartTLS upgrade is a second phase, and it is deliberately not inside
+// that goroutine. Two things there are unbounded by anything the dialer
+// can set:
+//
+//   - Waiting for the server's StartTLS response. go-ldap bounds it by the
+//     connection's own request timeout, which has to be set on the
+//     connection before the request is sent.
+//   - The TLS handshake that follows. go-ldap runs it with no deadline on
+//     the socket at all, so a server that answers StartTLS and then stops
+//     sending hangs until something closes the connection under it.
+//
+// net.Dialer.Timeout reaches neither: it bounds establishing the TCP
+// connection and nothing after. So the connection is brought into this
+// scope first, given a deadline, and only then upgraded — and if the
+// context wins the upgrade race, this closes that known connection
+// directly, which is both what unblocks the handshake and what stops a
+// server that accepts connections and goes silent from costing a
+// goroutine and a socket per attempt.
 func (d *netDialer) DialContext(ctx context.Context, addr string) (Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("ldapauth: dial %s: %w", addr, err)
 	}
 
-	type dialResult struct {
-		conn *ldap.Conn
-		err  error
+	timeout, err := d.budget(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ldapauth: dial %s: %w", addr, err)
 	}
 
+	conn, err := d.connect(ctx, addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	// Before anything is sent. This is what bounds the wait for the
+	// StartTLS response, and it is the deadline every later operation
+	// runs under.
+	if d.opTimeout > 0 {
+		conn.SetTimeout(d.opTimeout)
+	}
+
+	if d.startTLS && needsStartTLS(addr) {
+		// The upgrade gets what is left of the dial budget rather than
+		// the operation timeout: it is part of establishing the
+		// connection, and a caller who allowed a second to connect did
+		// not thereby allow a second more to negotiate TLS.
+		remaining, err := d.budget(ctx)
+		if err != nil {
+			_ = conn.Close()
+
+			return nil, fmt.Errorf("ldapauth: starttls %s: %w", addr, err)
+		}
+
+		if err := d.upgrade(ctx, conn, remaining); err != nil {
+			_ = conn.Close()
+
+			return nil, fmt.Errorf("ldapauth: starttls %s: %w", addr, err)
+		}
+	}
+
+	return conn, nil
+}
+
+// budget returns how long this dial may take: the configured dial timeout,
+// or what is left of the caller's deadline if that is sooner.
+func (d *netDialer) budget(ctx context.Context) (time.Duration, error) {
 	timeout := d.dialTimeout
 
 	if deadline, ok := ctx.Deadline(); ok {
@@ -112,7 +164,18 @@ func (d *netDialer) DialContext(ctx context.Context, addr string) (Conn, error) 
 	}
 
 	if timeout <= 0 {
-		return nil, fmt.Errorf("ldapauth: dial %s: %w", addr, context.DeadlineExceeded)
+		return 0, context.DeadlineExceeded
+	}
+
+	return timeout, nil
+}
+
+// connect opens the connection, racing go-ldap's context-free dial against
+// the caller's context.
+func (d *netDialer) connect(ctx context.Context, addr string, timeout time.Duration) (*ldap.Conn, error) {
+	type dialResult struct {
+		conn *ldap.Conn
+		err  error
 	}
 
 	results := make(chan dialResult, 1)
@@ -123,18 +186,6 @@ func (d *netDialer) DialContext(ctx context.Context, addr string) (Conn, error) 
 			ldap.DialWithDialer(&net.Dialer{Timeout: timeout}),
 			ldap.DialWithTLSConfig(d.tlsConfig),
 		)
-
-		// The upgrade happens here rather than after the race, because a
-		// StartTLS that hangs is a dial that hangs: it is a round trip to
-		// the same server, over the same connection, before anything
-		// useful can be sent.
-		if err == nil && d.startTLS && needsStartTLS(addr) {
-			if terr := conn.StartTLS(d.tlsConfig); terr != nil {
-				_ = conn.Close()
-
-				conn, err = nil, fmt.Errorf("ldapauth: starttls %s: %w", addr, terr)
-			}
-		}
 
 		results <- dialResult{conn: conn, err: err}
 	}()
@@ -154,13 +205,36 @@ func (d *netDialer) DialContext(ctx context.Context, addr string) (Conn, error) 
 			return nil, fmt.Errorf("ldapauth: dial %s: %w", addr, r.err)
 		}
 
-		conn := r.conn
+		return r.conn, nil
+	}
+}
 
-		if d.opTimeout > 0 {
-			conn.SetTimeout(d.opTimeout)
-		}
+// upgrade performs the StartTLS exchange on an established connection,
+// bounded by both timeout and the caller's context.
+//
+// Losing the race closes the connection rather than abandoning it. That is
+// the only thing that unblocks a TLS handshake go-ldap is running with no
+// deadline, and it is safe because the connection is not shared: nothing
+// else can reach it until this function returns.
+func (d *netDialer) upgrade(ctx context.Context, conn *ldap.Conn, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-		return conn, nil
+	done := make(chan error, 1)
+
+	go func() { done <- conn.StartTLS(d.tlsConfig) }()
+
+	select {
+	case err := <-done:
+		return err
+
+	case <-ctx.Done():
+		// Closing it here is what ends the goroutine: the read it is
+		// blocked in fails, StartTLS returns, and the send does not block
+		// because the channel is buffered.
+		_ = conn.Close()
+
+		return ctx.Err()
 	}
 }
 

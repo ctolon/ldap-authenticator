@@ -104,7 +104,17 @@ func (t *throttle) fail(username string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	entry := t.entryLocked(key, username)
+	element := t.elementLocked(key, username)
+	entry := element.Value.(*throttleEntry)
+
+	// Moved to the back on every failure, so that eviction is by last use
+	// rather than by first sight. Without this an account under active
+	// attack drifts towards the front of the list as new usernames arrive
+	// and can be evicted by the attacker who is attacking it — once, and
+	// then left alone. With it, pushing a real account's counter out of
+	// the table costs a full table's worth of fresh failed binds against
+	// the directory, and costs it again every time.
+	t.order.MoveToBack(element)
 
 	// A cooldown that has expired starts the count again rather than
 	// continuing it: the point is repeated failure, not lifetime failure.
@@ -141,15 +151,16 @@ func (t *throttle) succeed(username string) {
 	}
 }
 
-// entryLocked finds or creates the entry for a key. The caller holds the
-// lock.
-func (t *throttle) entryLocked(key, username string) *throttleEntry {
+// elementLocked finds or creates the list element for a key. The caller
+// holds the lock.
+func (t *throttle) elementLocked(key, username string) *list.Element {
 	if element, found := t.entries[key]; found {
-		return element.Value.(*throttleEntry)
+		return element
 	}
 
 	entry := &throttleEntry{username: username}
-	t.entries[key] = t.order.PushBack(entry)
+	element := t.order.PushBack(entry)
+	t.entries[key] = element
 
 	// Bounded, because the keys come from whatever anybody types into a
 	// login form. Evicting the oldest is the right way to lose: an
@@ -165,7 +176,7 @@ func (t *throttle) entryLocked(key, username string) *throttleEntry {
 		t.removeLocked(oldest)
 	}
 
-	return entry
+	return element
 }
 
 func (t *throttle) removeLocked(element *list.Element) {

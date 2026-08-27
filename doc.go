@@ -54,7 +54,8 @@
 // default, each replaceable one at a time:
 //
 //	Dialer           where connections come from       WithDialer
-//	Cache            where outcomes are remembered     WithCacheStore
+//	Cache            where outcomes are remembered     WithSealedCacheStore
+//	ByteStore        the same, over bytes              WithSealedCacheStore
 //	PrincipalMapper  what an authentication produces   WithPrincipalMapper
 //	GroupResolver    where groups come from            WithGroupResolver
 //	Metrics          where the numbers go              WithMetrics
@@ -169,9 +170,18 @@
 // Nothing here is shared between processes unless you share it. Each
 // replica has its own pool, its own failover state, and its own cache
 // secret — which means, by default, its own cache. To share one, give
-// every replica the same [WithCacheSecret] and a [WithCacheStore] that
-// points at the same place; without the shared secret the keys differ and
-// the shared cache silently never hits.
+// every replica the same [WithCacheSecret] and a [WithSealedCacheStore]
+// that points at the same place; without the shared secret the keys differ
+// and the shared cache silently never hits.
+//
+// [WithSealedCacheStore] takes a [ByteStore] — a Get, a Set, and two
+// invalidations over bytes, which is what Redis and memcached already are.
+// The authenticator serialises the identity, seals it under the same
+// secret that derives the key, and verifies the seal on the way out, so a
+// store somebody else can write to cannot decide who anybody is.
+// [WithCacheStore] is the lower-level form for callers who need their own
+// encoding, and leaves the value unauthenticated; see the security notes
+// on both options.
 //
 // Two things are worth knowing about running many of these at once. The
 // retry backoff is fully jittered, so a fleet that lost its directory at

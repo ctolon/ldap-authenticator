@@ -122,6 +122,13 @@ type Directory struct {
 	// the error text and needs nothing here.
 	BindControlHook func(dn string) []ldap.Control
 
+	// TimeoutHook, if set, is called every time an operation timeout is
+	// set on a connection. It is how a test sees the timeout the
+	// authenticator narrowed a connection to, which is otherwise
+	// invisible and is exactly where one request's deadline can leak
+	// into the next.
+	TimeoutHook func(timeout time.Duration)
+
 	// ReferralHook, if set, returns the referral URLs a search should be
 	// answered with. Return none for an ordinary search.
 	//
@@ -447,7 +454,16 @@ func (c *conn) WhoAmI([]ldap.Control) (*ldap.WhoAmIResult, error) {
 	return &ldap.WhoAmIResult{AuthzID: "dn:" + c.boundDN}, nil
 }
 
-func (c *conn) SetTimeout(time.Duration) {}
+// SetTimeout records the timeout, so that a test can assert on it.
+func (c *conn) SetTimeout(timeout time.Duration) {
+	c.dir.mu.Lock()
+	hook := c.dir.TimeoutHook
+	c.dir.mu.Unlock()
+
+	if hook != nil {
+		hook(timeout)
+	}
+}
 
 func (c *conn) IsClosing() bool {
 	c.mu.Lock()

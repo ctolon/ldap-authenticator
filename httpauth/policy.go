@@ -21,6 +21,25 @@ var ErrForbidden = errors.New("httpauth: identity is not in a required group")
 // is configured.
 const DefaultRealm = "Restricted"
 
+// DefaultMinimumDuration is how long an authentication is padded to when
+// nothing says otherwise.
+//
+// It is not zero, and that is a deliberate change from the first release.
+// Collapsing the *errors* — a wrong password and an unknown user return
+// the same one — closes the obvious enumeration oracle and leaves the
+// timing one wide open: under search-then-bind an unknown user costs one
+// round trip and a wrong password costs two, and the difference is
+// measurable across a network. With a cache in front, a hit is
+// microseconds and a miss is milliseconds, which leaks whether a
+// credential was recently used successfully.
+//
+// Every other decision of this kind in this package is made for the
+// caller and left available to override. This one was the exception, and
+// making it the default is the fix. Pass WithMinimumDuration(0) to turn it
+// off, and set it above your directory's typical login latency for it to
+// mean anything.
+const DefaultMinimumDuration = 100 * time.Millisecond
+
 // A Policy is the framework-independent half of HTTP authentication: it
 // turns a username and password into a principal, applies the group
 // requirement, and pads the response time. The middleware in this package
@@ -52,8 +71,9 @@ type Option func(*Policy) error
 // framework this repository does not ship.
 func NewPolicy(opts ...Option) (*Policy, error) {
 	p := &Policy{
-		realm:   DefaultRealm,
-		maxBody: DefaultMaxBodyBytes,
+		realm:       DefaultRealm,
+		maxBody:     DefaultMaxBodyBytes,
+		minDuration: DefaultMinimumDuration,
 	}
 
 	for i, opt := range opts {
@@ -130,8 +150,10 @@ func RequireAllGroups(groups ...string) Option {
 // on a directory round trip can be — but it moves the signal below the
 // noise of the network in front of it.
 //
-// Pick a value above your directory's typical login latency: 100ms is a
-// reasonable starting point. Zero, the default, does not pad.
+// Pick a value above your directory's typical login latency;
+// DefaultMinimumDuration, which is what you get without this option, is
+// 100ms. Zero turns padding off, which is worth doing only when something
+// in front of this is already flattening response times.
 func WithMinimumDuration(d time.Duration) Option {
 	return func(p *Policy) error {
 		if d < 0 {

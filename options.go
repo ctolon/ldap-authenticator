@@ -1016,6 +1016,22 @@ func WithNegativeCache(ttl time.Duration) Option {
 // services is a cache in which one service's authentication decisions
 // become the other's.
 //
+// # Read the write side before you use this
+//
+// A Cache is handed a decoded [Identity] and trusted for what it returns.
+// The key is an HMAC, so nobody can read an entry without the secret, but
+// nothing authenticates the value: anybody who can write to the store can
+// put an identity carrying "cn=domain admins" under a key of their choosing,
+// and the login that lands on it is authorised as that. This is not a
+// theoretical asymmetry — a Redis with no auth on a flat network is the
+// normal way it happens.
+//
+// Prefer [WithSealedCacheStore], which authenticates the value as well as
+// the key. Use this option when you need control over the encoding, or
+// when [WithPrincipalMapper] gives you an identity this package cannot
+// serialise; then treat write access to the store as equivalent to write
+// access to the directory, and say so in your threat model.
+//
 // Caching must be turned on with [WithCache] as well; a store with no TTL
 // configured is a configuration error rather than an implicit default.
 func WithCacheStore(store Cache) Option {
@@ -1025,6 +1041,51 @@ func WithCacheStore(store Cache) Option {
 		}
 
 		c.cacheStore = store
+
+		return nil
+	}
+}
+
+// WithSealedCacheStore shares a cache across replicas without trusting
+// what is in it.
+//
+//	ldapauth.WithCache(30*time.Second),
+//	ldapauth.WithCacheSecret(secretFromYourSecretManager),
+//	ldapauth.WithSealedCacheStore(redisStore{client}),
+//
+// A [ByteStore] holds bytes, which is what Redis and memcached are. The
+// authenticator serialises the identity, seals it with HMAC-SHA-256 under
+// the same secret that derives the key, and verifies the seal on the way
+// back out. A value that does not verify is a miss: it is logged, counted
+// by [Metrics.CacheEvent] under [CacheError], and the directory is asked.
+// So a store can lose entries, or be written to by somebody who should not
+// be, without ever being able to decide who somebody is.
+//
+// This is the option to reach for. [WithCacheStore] leaves the value
+// unauthenticated and exists for callers who need their own encoding.
+//
+// Two things it does not carry:
+//
+//   - [Principal.Extra] is dropped. It holds a value of your type, and
+//     JSON would hand it back as a map — so a cached login would differ
+//     from an uncached one in a way that only shows up in production.
+//   - A custom [Identity] from [WithPrincipalMapper] cannot be encoded at
+//     all. The write fails, is logged and counted, and the login proceeds
+//     uncached. Use [WithCacheStore] with your own serialisation instead.
+//
+// The same [WithCacheSecret] must reach every replica, both for the keys
+// to match and for the seals to verify. Rotating it invalidates the shared
+// cache rather than corrupting it: every key changes, and any entry found
+// under an old key fails its seal and is treated as a miss.
+//
+// Caching must be turned on with [WithCache] as well.
+func WithSealedCacheStore(store ByteStore) Option {
+	return func(c *config) error {
+		if store == nil {
+			return fmt.Errorf("%w: WithSealedCacheStore was given a nil store", ErrInvalidOption)
+		}
+
+		c.sealedStore = store
 
 		return nil
 	}

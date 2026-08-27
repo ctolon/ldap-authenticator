@@ -30,11 +30,23 @@ import (
 // in flight. The pool discards it, because release discards on any error
 // and a cancellation is an error.
 func (a *Client) operate(ctx context.Context, conn Conn, fn func() error) error {
+	return operate(ctx, a.cfg, conn, fn)
+}
+
+// operate is the same, without a Client.
+//
+// The pool needs it too — its service bind and its health probe are LDAP
+// operations like any other, and for a release they were not treated as
+// such: both called through to go-ldap directly, so a caller with fifty
+// milliseconds left could block for the full operation timeout inside
+// acquire and could not be cancelled at all. That is the pool's half of
+// the bug the rest of this file exists to fix.
+func operate(ctx context.Context, cfg *config, conn Conn, fn func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	timeout, expired := a.cfg.effectiveTimeout(ctx)
+	timeout, expired := cfg.effectiveTimeout(ctx)
 	if expired {
 		return context.DeadlineExceeded
 	}
@@ -55,7 +67,7 @@ func (a *Client) operate(ctx context.Context, conn Conn, fn func() error) error 
 
 	case <-ctx.Done():
 		_ = conn.Close()
-		a.cfg.metrics.ConnClosed("cancelled")
+		cfg.metrics.ConnClosed("cancelled")
 
 		return ctx.Err()
 	}

@@ -9,7 +9,7 @@ replace one, or replace all seven.
 | `Identity` | `*Principal` | `WithPrincipalMapper` |
 | `PrincipalMapper` | attribute mapping | `WithPrincipalMapper` |
 | `GroupResolver` | directory resolution | `WithGroupResolver` |
-| `Cache` | in-memory, TTL-bounded | `WithCacheStore` |
+| `Cache` | in-memory, TTL-bounded | `WithSealedCacheStore`, or `WithCacheStore` |
 | `Dialer` | TCP, TLS, StartTLS | `WithDialer` |
 | `Metrics` | no-op | `WithMetrics` |
 
@@ -106,11 +106,61 @@ result, err := r.Search.Search(ctx, ldap.NewSearchRequest(
 
 ## A shared cache
 
+Two interfaces, and the first is almost always the one you want.
+
+### `ByteStore` — what Redis and memcached already are
+
+```go
+type redisStore struct{ client *redis.Client }
+
+func (s redisStore) Get(ctx context.Context, key string) ([]byte, bool, error) {
+    raw, err := s.client.Get(ctx, "ldapauth:"+key).Bytes()
+    switch {
+    case errors.Is(err, redis.Nil):
+        return nil, false, nil
+    case err != nil:
+        return nil, false, err
+    }
+
+    return raw, true, nil
+}
+
+func (s redisStore) Set(ctx context.Context, key, username string, value []byte, ttl time.Duration) error {
+    if err := s.client.Set(ctx, "ldapauth:"+key, value, ttl).Err(); err != nil {
+        return err
+    }
+
+    // InvalidateUser has to find an account's entries without knowing the
+    // password that keyed them, so keep an index.
+    return s.client.SAdd(ctx, "ldapauth:user:"+strings.ToLower(username), key).Err()
+}
+
+// InvalidateUser, InvalidateAll, Len likewise.
+```
+
+```go
+ldapauth.WithCache(30*time.Second),
+ldapauth.WithCacheSecret(secretFromYourSecretManager),
+ldapauth.WithSealedCacheStore(redisStore{client}),
+```
+
+No serialisation, no identity types, no `Principal` — the authenticator
+encodes the value, seals it with `HMAC-SHA256(secret, key ‖ 0x00 ‖ value)`,
+and verifies that seal on the way back. An entry that fails to verify is a
+miss: logged, counted through `Metrics.CacheEvent` under `CacheError`,
+and answered by asking the directory.
+
+It does not carry `Principal.Extra`, and it cannot encode a custom
+`Identity` from `WithPrincipalMapper` — the write fails, is counted, and the
+login proceeds uncached. That is when the second interface exists.
+
+### `Cache` — when the encoding has to be yours
+
 ```go
 type redisCache struct{ client *redis.Client }
 
 func (c redisCache) Get(ctx context.Context, key string) (ldapauth.Identity, bool, error) {
-    raw, err := c.client.Get(ctx, "ldapauth:"+hex.EncodeToString([]byte(key))).Bytes()
+    raw, err := c.client.Get(ctx, "ldapauth:"+key).Bytes()
     switch {
     case errors.Is(err, redis.Nil):
         return nil, false, nil
@@ -133,11 +183,22 @@ func (c redisCache) Get(ctx context.Context, key string) (ldapauth.Identity, boo
 // Set, InvalidateUser, InvalidateAll, Len likewise.
 ```
 
-Three things to know.
+Four things to know.
 
-**Keys are opaque and the store never sees a credential.** The key is an
-HMAC of the username and password under the authenticator's secret. It is
-raw bytes, not a string you can safely put in a URL — encode it.
+**Nothing authenticates the value.** The authenticator is handed a decoded
+`Identity` and believes it. The key is an HMAC, so nobody without the secret
+can address a particular login — but anybody who can *write* to the store
+can put an identity carrying whatever groups they like under a key of their
+choosing, and the login that lands on it is authorised as that. If you use
+this interface against a shared store, write access to that store is
+equivalent to write access to the directory. Say so in your threat model.
+[`examples/sealed-cache`](../examples/sealed-cache) demonstrates both sides
+of this in about a screen of output.
+
+**Keys are opaque and the store never sees a credential.** The key is a
+hex-encoded HMAC of the username and password under the authenticator's
+secret: printable, fixed length, and a valid memcached key with no encoding
+of your own.
 
 **A shared cache needs a shared secret.** By default the secret is drawn
 from the system CSPRNG at startup, so every replica derives a different key

@@ -241,6 +241,57 @@ What follows from that:
 And the boundary: a cache shared between two services makes one service's
 authentication decisions into the other's.
 
+### Reading the cache is not the dangerous half
+
+Everything above is about somebody who can *read* the store. Somebody who
+can *write* to it has a shorter path.
+
+The key is an HMAC, so an attacker without the secret cannot address a
+particular login. The value is not protected at all. Against a plain
+`WithCacheStore`, whatever the store returns is decoded and believed — so
+writing an identity carrying `cn=domain admins` under any key at all means
+that whenever a login happens to land on that key, the application is told
+the directory said so. Nothing binds the value to the key, to the secret,
+or to the directory. A Redis with no auth on a flat network is the normal
+way this happens, and it is not a subtle failure: it is authorisation
+granted by anyone who can write a string.
+
+`WithSealedCacheStore` closes it:
+
+```go
+ldapauth.WithCache(30*time.Second),
+ldapauth.WithCacheSecret(secretFromYourSecretManager),
+ldapauth.WithSealedCacheStore(redisStore{client}),   // a ByteStore
+```
+
+A `ByteStore` holds bytes — which is what Redis and memcached actually are.
+The authenticator serialises the identity, seals it with
+`HMAC-SHA256(secret, key ‖ 0x00 ‖ value)`, and verifies that on the way back
+out. The key is inside the MAC as well as derived from the secret, so a
+valid entry cannot be copied to another key; the version is inside it, so a
+future format cannot be replayed as this one; and a rejection is sealed too,
+so it can be neither forged into a success nor a success into a lockout.
+Anything that fails to verify is a **miss** — logged, counted through
+`Metrics.CacheEvent` under `CacheError`, and answered by asking the
+directory. A store can be lost, corrupted, or hostile without ever being
+able to decide who somebody is.
+
+Nothing produces `ErrCacheTampered` by accident. Alert on it.
+
+Two things a sealed cache does not carry, both deliberate:
+
+- **`Principal.Extra`.** It holds a value of your type; JSON hands it back
+  as a map, so a cached login would differ from an uncached one in a way
+  that only appears in production.
+- **A custom `Identity` from `WithPrincipalMapper`.** It cannot be encoded,
+  so the write fails, is logged and counted, and the login proceeds
+  uncached.
+
+If either matters, use `WithCacheStore` with your own serialisation — and
+then write-side trust is yours to establish. Treat write access to that
+store as equivalent to write access to the directory, and put that sentence
+in your threat model rather than in a comment.
+
 ### The username in the store
 
 The key hides the credential. The username travels beside it in the clear,

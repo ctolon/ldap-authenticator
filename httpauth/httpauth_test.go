@@ -555,3 +555,79 @@ func TestLockoutIsTooManyRequests(t *testing.T) {
 		t.Errorf("status = %d, want 429 once the account is in its cooldown", code)
 	}
 }
+
+func TestPaddingIsOnByDefault(t *testing.T) {
+	t.Parallel()
+
+	// Collapsing the errors closes the obvious enumeration oracle and
+	// leaves the timing one open. Under search-then-bind an unknown user
+	// costs one round trip and a wrong password costs two; with a cache
+	// in front, a hit is microseconds and a miss is milliseconds. The
+	// default has to close that, or the guarantee on the front of the
+	// README is only half true.
+	handler := httpauth.BasicAuth(newAuth(t))(echoIdentity)
+
+	req := httptest.NewRequest(http.MethodGet, "/private", nil)
+	req.SetBasicAuth("alice", "wrong")
+
+	started := time.Now()
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if elapsed := time.Since(started); elapsed < httpauth.DefaultMinimumDuration {
+		t.Errorf("a rejection took %s with no padding configured; want at least %s",
+			elapsed, httpauth.DefaultMinimumDuration)
+	}
+}
+
+func TestPaddingCanBeTurnedOff(t *testing.T) {
+	t.Parallel()
+
+	// Off is a legitimate choice — something in front may already be
+	// flattening response times — so it has to remain reachable.
+	handler := httpauth.BasicAuth(newAuth(t), httpauth.WithMinimumDuration(0))(echoIdentity)
+
+	req := httptest.NewRequest(http.MethodGet, "/private", nil)
+	req.SetBasicAuth("alice", "wrong")
+
+	started := time.Now()
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if elapsed := time.Since(started); elapsed >= httpauth.DefaultMinimumDuration {
+		t.Errorf("a rejection took %s with padding turned off", elapsed)
+	}
+}
+
+func TestPaddingFlattensTheCacheHitAndMiss(t *testing.T) {
+	t.Parallel()
+
+	// The channel that survives collapsing the errors: a cached success
+	// answers in microseconds and an uncached one in milliseconds, which
+	// says whether this credential was recently used.
+	auth := newAuth(t, ldapauth.WithCache(time.Minute))
+
+	handler := httpauth.BasicAuth(auth)(echoIdentity)
+
+	send := func() time.Duration {
+		req := httptest.NewRequest(http.MethodGet, "/private", nil)
+		req.SetBasicAuth("alice", "alice-pw")
+
+		started := time.Now()
+
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+
+		return time.Since(started)
+	}
+
+	miss := send()
+	hit := send()
+
+	for name, d := range map[string]time.Duration{"miss": miss, "hit": hit} {
+		if d < httpauth.DefaultMinimumDuration {
+			t.Errorf("a cache %s answered in %s, below the %s floor", name, d, httpauth.DefaultMinimumDuration)
+		}
+	}
+}

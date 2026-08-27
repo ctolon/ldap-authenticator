@@ -297,6 +297,12 @@ type config struct {
 	// cacheStore replaces the in-memory cache; see WithCacheStore.
 	cacheStore Cache
 
+	// sealedStore is a byte-oriented store to be wrapped in a sealed
+	// cache at build time, so that the seal and the key derivation use
+	// the same secret without the caller having to pass it twice; see
+	// WithSealedCacheStore.
+	sealedStore ByteStore
+
 	// cacheSecret keys the credential hash. Empty means "generate a
 	// per-process one", which is the default and the safe answer for a
 	// single process.
@@ -645,7 +651,14 @@ func (c *config) validateLimits() error {
 		return fmt.Errorf("%w: retry max attempts %d is negative", ErrInvalidOption, c.retryMaxAttempts)
 	}
 
-	if !c.cacheEnabled && (c.cacheStore != nil || len(c.cacheSecret) > 0) {
+	if c.cacheStore != nil && c.sealedStore != nil {
+		return fmt.Errorf(
+			"%w: WithCacheStore and WithSealedCacheStore both set a cache; pick one",
+			ErrInvalidOption,
+		)
+	}
+
+	if !c.cacheEnabled && (c.cacheStore != nil || c.sealedStore != nil || len(c.cacheSecret) > 0) {
 		return fmt.Errorf(
 			"%w: a cache store or secret is configured but caching is off; WithCache turns it on",
 			ErrInvalidOption,

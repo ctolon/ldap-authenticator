@@ -129,6 +129,43 @@ A group requirement with no group source configured rejects everybody,
 because the principal arrives with no groups. That is a configuration
 mistake worth watching for.
 
+## When group resolution fails
+
+The login fails with it, even though the password was already verified.
+That is a choice, and the alternative is worse: returning the identity with
+no groups hands the application a principal that looks like a real login by
+somebody who belongs to nothing. Every `RequireAnyGroup` check reads that as
+"not authorised" and every check that only asks whether somebody is logged
+in reads it as "yes" — so a group server having a bad afternoon quietly
+demotes everybody instead of locking them out, and a silent demotion is far
+harder to notice than an outage.
+
+Since a failure aborts the login, group resolution is on the critical path
+in the way the directory is. If groups come from somewhere slower or less
+reliable than the directory — an entitlements service, a database — that is
+worth knowing before you point `WithGroupResolver` at it.
+
+If your deployment would rather degrade than stop, say so in code by
+wrapping the resolver:
+
+```go
+fallible := ldapauth.GroupResolverFunc(
+    func(ctx context.Context, request ldapauth.GroupRequest) ([]string, error) {
+        groups, err := inner.ResolveGroups(ctx, request)
+        if err != nil {
+            logger.Error("group resolution failed; logging in with none", "err", err)
+
+            return nil, nil
+        }
+
+        return groups, nil
+    },
+)
+```
+
+Written out, the trade is visible in the code that made it. There is no
+option for it, because an option would make it look like a tuning knob.
+
 ## When the directory is not where groups live
 
 `WithGroupResolver` replaces all of the above with your own code, and hands
