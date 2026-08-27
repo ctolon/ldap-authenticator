@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-27
+
 A review of 1.1 found a resource leak reachable by any server that accepts
 a connection and stops talking, a bug that could hang a request past every
 timeout in the configuration, two that made bounded things unbounded, and a
@@ -399,6 +401,7 @@ generates — and asserting that the wrong CA and the wrong hostname are both
 refused, so that the TLS tests cannot pass the way `InsecureSkipVerify`
 would let them.
 
-[Unreleased]: https://github.com/ctolon/ldap-authenticator/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/ctolon/ldap-authenticator/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/ctolon/ldap-authenticator/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/ctolon/ldap-authenticator/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/ctolon/ldap-authenticator/releases/tag/v1.0.0
